@@ -28,4 +28,4 @@ gradio>=4.20
 
 # Optional: dataset download helpers
 huggingface_hub>=0.22
-kaggle>=1.6
+kagglehub>=0.3   # used by data/download_cifake.py -- simpler auth than the raw `kaggle` CLI

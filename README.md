@@ -47,7 +47,8 @@ aigc-detector/
 ├── data/
 │   ├── datasets.py         # PyTorch Dataset classes for the labeled image folders
 │   ├── transforms.py       # the robustness augmentation pipeline (this is the core of the "robust" story)
-│   └── prepare_data.py     # dataset download / layout helpers
+│   ├── prepare_data.py     # dataset download / layout instructions
+│   └── download_cifake.py  # CIFAKE: kagglehub download + auto-reorganize into real/fake folders
 ├── model/
 │   ├── cnn_stem.py         # ConvStem: CNN feature extractor (primary architecture)
 │   ├── transformer_encoder.py  # TokenTransformer: self-attention over the CNN's tokens
@@ -90,6 +91,10 @@ params).
    each dataset (SID_Set, CIFAKE, WildFake) into `data/raw/<dataset>/{real,fake}/`. See
    the TODOs in that file — dataset licenses/download mechanics differ, so this step is
    deliberately manual/semi-automated rather than a single script.
+   - **CIFAKE** is the one exception with a fully automated path:
+     `python data/download_cifake.py --out data/raw/cifake` downloads it via
+     kagglehub and reorganizes it into the expected `real/`/`fake/` layout in one
+     step (add `--copy` if your filesystem doesn't support symlinks).
    - Do **not** train on the WildFake (COCO val2017 / DALL·E Advanced) validation subset
      — it's reserved for demonstration/tracking only, per the challenge rules.
    - **No data yet, or just want to sanity-check the pipeline?** Run
@@ -150,6 +155,7 @@ params).
 ```bash
 python tests/test_transforms.py          # torch-free; verifies the augmentation pipeline itself
 python tests/test_synthetic_dataset.py   # torch-free; verifies the network-free synthetic dataset generator
+python tests/test_download_cifake.py     # torch-free; verifies the CIFAKE reorganization logic (no network needed)
 python tests/test_model_shapes.py        # needs torch; forward/backward-pass + attention-rollout shape checks
 ```
 

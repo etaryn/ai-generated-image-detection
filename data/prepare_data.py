@@ -46,13 +46,16 @@ Then reorganize the downloaded files into:
     "cifake": """
 CIFAKE (Kaggle): https://www.kaggle.com/datasets/birdy654/cifake-real-and-ai-generated-synthetic-images
 
-    pip install kaggle   # requires a Kaggle API token in ~/.kaggle/kaggle.json
-    kaggle datasets download -d birdy654/cifake-real-and-ai-generated-synthetic-images -p data/raw/_cifake_zip
-    unzip data/raw/_cifake_zip/*.zip -d data/raw/_cifake_extracted
+    python data/download_cifake.py --out data/raw/cifake
 
-CIFAKE ships with its own REAL/FAKE train/test folders — move/symlink them into:
+This downloads via kagglehub (prompts for Kaggle credentials once, then caches --
+no manual kaggle.json setup needed) and automatically reorganizes CIFAKE's own
+train/test x REAL/FAKE folders into:
     data/raw/cifake/real/*.jpg
     data/raw/cifake/fake/*.jpg
+merging both splits together (this project does its own train/val split on top).
+Pass --copy instead of the default symlinks if your filesystem doesn't support
+them (e.g. Windows without Developer Mode enabled).
 """,
     "wildfake": """
 WildFake (ModelScope): https://modelscope.cn/datasets/hy2628982280/WildFake/summary
