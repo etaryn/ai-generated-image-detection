@@ -10,6 +10,10 @@ dataset. All datasets should land in:
 
 so that `data/datasets.py`'s `RealFakeImageDataset` can load them uniformly.
 
+No network access yet, or just want to sanity-check the pipeline mechanics first?
+See `data/make_synthetic_dataset.py` for a network-free synthetic stand-in dataset
+(not a substitute for real data -- see its docstring).
+
 IMPORTANT: the WildFake "Validation Dataset" subset named in the challenge brief
 (COCO val2017 as real, DALL-E Advanced as fake) is for demonstration/tracking only
 and must NOT be placed under a train_datasets root — keep it under

@@ -92,6 +92,13 @@ params).
    deliberately manual/semi-automated rather than a single script.
    - Do **not** train on the WildFake (COCO val2017 / DALL·E Advanced) validation subset
      — it's reserved for demonstration/tracking only, per the challenge rules.
+   - **No data yet, or just want to sanity-check the pipeline?** Run
+     `python data/make_synthetic_dataset.py --out data/raw/synthetic --n_per_class 200`
+     to generate a network-free synthetic dataset (smooth "scenes" as "real", the same
+     scenes with a subtle periodic upsampling-style artifact added as "fake") and set
+     `train_datasets: ["synthetic"]` in the config. This exercises the whole pipeline
+     end-to-end but is **not a substitute for real data** — a model trained only on it
+     will just learn to detect the synthetic artifact pattern, nothing more.
 2. **Train the model.**
    ```bash
    python train.py --config configs/default.yaml
@@ -141,8 +148,9 @@ params).
 ## Running the tests
 
 ```bash
-python tests/test_transforms.py     # torch-free; verifies the augmentation pipeline itself
-python tests/test_model_shapes.py   # needs torch; forward/backward-pass + attention-rollout shape checks
+python tests/test_transforms.py          # torch-free; verifies the augmentation pipeline itself
+python tests/test_synthetic_dataset.py   # torch-free; verifies the network-free synthetic dataset generator
+python tests/test_model_shapes.py        # needs torch; forward/backward-pass + attention-rollout shape checks
 ```
 
 Both scripts are also plain `pytest`-discoverable (`pytest tests/`) if you have pytest

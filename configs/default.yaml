@@ -6,6 +6,9 @@ data:
   # Where prepare_data.py lays out each dataset:
   #   data/raw/<dataset_name>/real/*.jpg
   #   data/raw/<dataset_name>/fake/*.jpg
+  # "synthetic" (data/make_synthetic_dataset.py) is a network-free stand-in for
+  # smoke-testing the pipeline before real data is downloaded/laid out -- swap
+  # in "sid_set"/"cifake"/"wildfake" for an actual training run.
   train_datasets: ["sid_set", "cifake"]     # + "wildfake" if compute allows
   val_split: 0.1                             # held out from train_datasets (in-distribution val)
   image_size: 224
