@@ -5,6 +5,7 @@ __pycache__/
 data/raw/
 data/cache/
 checkpoints/
+checkpoints_smoke/
 *.ckpt
 *.pt
 outputs/

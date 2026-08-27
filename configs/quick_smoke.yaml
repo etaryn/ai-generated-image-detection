@@ -1,6 +1,10 @@
-# Default configuration for the AIGC detector.
-# Override any of these on the command line, e.g.:
-#   python train.py --config configs/default.yaml --model.backbone_name ViT-L-14
+# QUICK SMOKE-TEST configuration -- same as default.yaml but with a tiny
+# epoch count, meant to answer one question fast: does the full pipeline
+# (data loading -> augmentation -> paired clean/aug forward+backward -> 
+# checkpoint save) actually run end-to-end on real data, before committing
+# to a long training run with configs/default.yaml.
+#
+# Usage: python train.py --config configs/quick_smoke.yaml
 
 data:
   # Where prepare_data.py lays out each dataset:
@@ -74,11 +78,11 @@ model:
   head_dropout: 0.2
 
 train:
-  epochs: 15
+  epochs: 2                      # just enough epochs to prove the loop runs and loss moves
   lr: 1.0e-3
   weight_decay: 1.0e-4
   consistency_loss_weight: 0.5   # weight on clean-vs-augmented logit consistency loss
-  checkpoint_dir: "checkpoints/"
+  checkpoint_dir: "checkpoints_smoke/"   # separate dir so this doesn't clobber a real run's checkpoints
   log_every: 50
   seed: 42
 
