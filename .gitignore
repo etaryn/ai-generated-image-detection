@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/raw/
+data/cache/
+checkpoints/
+*.ckpt
+*.pt
+outputs/
+predictions.json
+eval/robustness_matrix.csv
+eval/*.png
+.DS_Store
+.ipynb_checkpoints/

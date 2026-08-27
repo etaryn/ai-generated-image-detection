@@ -1,0 +1,63 @@
+# Default configuration for the AIGC detector.
+# Override any of these on the command line, e.g.:
+#   python train.py --config configs/default.yaml --model.backbone_name ViT-L-14
+
+data:
+  # Where prepare_data.py lays out each dataset:
+  #   data/raw/<dataset_name>/real/*.jpg
+  #   data/raw/<dataset_name>/fake/*.jpg
+  train_datasets: ["sid_set", "cifake"]     # + "wildfake" if compute allows
+  val_split: 0.1                             # held out from train_datasets (in-distribution val)
+  image_size: 224
+  batch_size: 64
+  num_workers: 8
+
+  # NOTE: the WildFake COCO/DALL-E "Validation Dataset" from the challenge brief is
+  # demonstration-only and must NOT appear in train_datasets or val_split above.
+  demo_eval_set:
+    real_dir: "data/raw/wildfake_demo/coco_val2017"
+    fake_dir: "data/raw/wildfake_demo/dalle_advanced"
+
+augmentation:
+  # Probabilities are independent per-sample; transforms can stack, matching the
+  # challenge's "subset of the following augmentations" robustness framing.
+  jpeg:
+    prob: 0.5
+    qualities: [90, 70, 50, 30]
+  gaussian_blur:
+    prob: 0.4
+    sigmas: [0.5, 1.0, 2.0]
+  resize_roundtrip:
+    prob: 0.4
+    scales: [0.5, 0.25]
+  gaussian_noise:
+    prob: 0.4
+    sigmas: [0.02, 0.05, 0.10]
+  color_jitter:
+    prob: 0.4
+    max_delta: 0.20        # +/-20% brightness / contrast / saturation
+  center_crop:
+    prob: 0.3
+    crop_fraction: 0.80
+
+model:
+  backbone_name: "ViT-B-16"     # or "ViT-L-14" if compute allows; both well under 2B params
+  pretrained: "openai"          # open_clip pretrained tag
+  freeze_backbone: true
+  use_freq_branch: false        # set true to enable the optional DCT/FFT fusion branch
+  head_hidden_dim: 256
+  head_dropout: 0.2
+
+train:
+  epochs: 15
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  consistency_loss_weight: 0.5   # weight on clean-vs-augmented logit consistency loss
+  checkpoint_dir: "checkpoints/"
+  log_every: 50
+  seed: 42
+
+eval:
+  threshold: 0.5                 # decision threshold; see error_analysis for FPR-budget calibration
+  severities: ["clean", "mild", "moderate", "severe"]
+  output_dir: "eval/outputs/"

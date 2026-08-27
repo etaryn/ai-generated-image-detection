@@ -1,0 +1,28 @@
+# Core ML
+torch>=2.1
+torchvision>=0.16
+open_clip_torch>=2.24   # CLIP backbone (or swap for transformers' CLIPModel)
+transformers>=4.40
+
+# Data / image processing
+Pillow>=10.0
+opencv-python-headless>=4.9
+numpy>=1.26
+scipy>=1.11
+
+# Metrics / eval
+scikit-learn>=1.4
+pandas>=2.2
+matplotlib>=3.8
+seaborn>=0.13
+
+# Config / CLI
+PyYAML>=6.0
+tqdm>=4.66
+
+# Demo
+gradio>=4.20
+
+# Optional: dataset download helpers
+huggingface_hub>=0.22
+kaggle>=1.6
