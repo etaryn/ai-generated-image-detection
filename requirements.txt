@@ -1,6 +1,9 @@
 # Core ML
 torch>=2.1
 torchvision>=0.16
+
+# Only required for the "clip_frozen" alternative architecture (model.architecture
+# in configs/default.yaml); not needed for the default "cnn_transformer" hybrid.
 open_clip_torch>=2.24   # CLIP backbone (or swap for transformers' CLIPModel)
 transformers>=4.40
 

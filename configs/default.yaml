@@ -41,9 +41,31 @@ augmentation:
     crop_fraction: 0.80
 
 model:
-  backbone_name: "ViT-B-16"     # or "ViT-L-14" if compute allows; both well under 2B params
-  pretrained: "openai"          # open_clip pretrained tag
-  freeze_backbone: true
+  # Team decision: CNN + Transformer hybrid is the primary architecture.
+  # "clip_frozen" (frozen CLIP backbone + linear head) is kept as an alternative/
+  # baseline you can switch back to by changing this one field.
+  architecture: "cnn_transformer"   # "cnn_transformer" | "clip_frozen"
+  input_image_size: 224
+
+  cnn_transformer:
+    # ConvStem: 4 stride-2 stages -> 224/16 = 14x14 grid of feature vectors.
+    stem_channels: [64, 128, 256, 384]
+    # TokenTransformer: standard multi-head self-attention encoder over the
+    # CNN's local feature tokens (+ a learnable [CLS] token for pooling).
+    transformer_dim: 384
+    transformer_depth: 6
+    transformer_heads: 6
+    transformer_mlp_ratio: 4.0
+    dropout: 0.1
+    # Trainable end-to-end (no frozen component) -> total params ~14M,
+    # far under the challenge's 2B limit, but expect to need more epochs/data
+    # than the frozen-backbone baseline since there's no pretraining to lean on.
+
+  clip_frozen:
+    backbone_name: "ViT-B-16"     # or "ViT-L-14" if compute allows; both well under 2B params
+    pretrained: "openai"          # open_clip pretrained tag
+    freeze_backbone: true
+
   use_freq_branch: false        # set true to enable the optional DCT/FFT fusion branch
   head_hidden_dim: 256
   head_dropout: 0.2
