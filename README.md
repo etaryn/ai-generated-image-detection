@@ -55,14 +55,18 @@ aigc-detector/
 │   ├── freq_branch.py      # optional frequency-domain (DCT) feature branch
 │   ├── head.py             # small trainable MLP classification head
 │   └── detector.py         # picks architecture from config, combines it (+ optional freq branch) + head
-├── train.py                 # training loop (trains only the head / freq branch)
+├── train.py                 # end-to-end training loop with clean/augmented consistency loss
 ├── infer.py                 # CLI: image directory in -> JSON [{"image_path", "pred"}] out
 ├── eval/
-│   ├── metrics.py          # accuracy / AUC / F1 / FPR-at-threshold
-│   ├── robustness_eval.py  # builds the transform x severity evaluation matrix
-│   └── error_analysis.py   # pulls representative false positives / false negatives
+│   ├── metrics.py           # accuracy / AUC / F1 / FPR-at-threshold
+│   ├── robustness_eval.py   # builds the transform x severity evaluation matrix
+│   ├── error_analysis.py    # pulls representative false positives / false negatives
+│   └── attention_rollout.py # explainability: rolls up self-attention into a saliency map
 ├── demo/
 │   └── app.py               # minimal Gradio dashboard for the demo video
+├── tests/
+│   ├── test_transforms.py   # torch-free tests for the augmentation pipeline (runs anywhere)
+│   └── test_model_shapes.py # model forward/backward-pass + attention-rollout shape tests (needs torch)
 └── notebooks/
     └── exploration.ipynb    # scratch space for data exploration (not required)
 ```
@@ -94,9 +98,13 @@ params).
    ```
    With the default `model.architecture: cnn_transformer`, this trains the CNN stem +
    Transformer encoder + head end-to-end (and the optional frequency branch, if
-   enabled) with the robustness-augmentation pipeline from `data/transforms.py` applied
-   on the fly. Switch to `model.architecture: clip_frozen` in the config to instead
-   freeze a pretrained CLIP backbone and train only the head.
+   enabled). Each training sample is loaded as a genuine clean/augmented pair (see
+   `data/datasets.py`'s `PairedViewDataset`): both views are classified, and a
+   consistency loss penalizes the model for predicting differently on the clean vs.
+   redistributed copy of the same image -- directly optimizing the "robust under
+   transform" objective rather than hoping augmentation exposure alone produces it.
+   Switch to `model.architecture: clip_frozen` in the config to instead freeze a
+   pretrained CLIP backbone and train only the head.
 3. **Run the robustness evaluation.**
    ```bash
    python eval/robustness_eval.py --config configs/default.yaml --checkpoint <path>
@@ -121,6 +129,28 @@ params).
    ```
    `pred` is the model's confidence that the image is AI-generated, in `[0, 1]`.
 
+6. **(Optional) Explain a single prediction** via attention rollout (CNN + Transformer
+   architecture only):
+   ```bash
+   python eval/attention_rollout.py --checkpoint <path> --image path/to/image.jpg --output rollout.png
+   ```
+   Rolls up the Transformer's per-layer self-attention into a single saliency map
+   showing which image regions most influenced the [CLS] token used for the final
+   decision (Abnar & Zuidema, "Quantifying Attention Flow in Transformers", 2020).
+
+## Running the tests
+
+```bash
+python tests/test_transforms.py     # torch-free; verifies the augmentation pipeline itself
+python tests/test_model_shapes.py   # needs torch; forward/backward-pass + attention-rollout shape checks
+```
+
+Both scripts are also plain `pytest`-discoverable (`pytest tests/`) if you have pytest
+installed. `test_transforms.py` has been run and passes in this project's dev
+environment; `test_model_shapes.py` has only been verified by hand (shape/parameter-count
+arithmetic) since no torch install was available when it was written -- run it first in
+your real environment, before starting a full training run.
+
 ## Limitations and future work
 
 - The CNN + Transformer hybrid trains fully from scratch, so it has no pretrained
@@ -140,6 +170,11 @@ params).
   families beyond what's in SID_Set/CIFAKE/WildFake), and add a lightweight
   active-learning loop to mine hard examples from the error analysis step back into
   training.
+- The model code was written and shape/parameter-count-verified by hand (and unit
+  tested where torch-free, e.g. `tests/test_transforms.py`) in an environment without
+  network access to install torch, so `tests/test_model_shapes.py` -- which actually
+  runs a forward/backward pass -- has not yet been executed for real. Run it first
+  thing in your training environment; see "Running the tests" above.
 
 ## Team member contributions
 

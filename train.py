@@ -1,7 +1,14 @@
-"""Trains only the classification head (and optional frequency branch) on top of
-the frozen CLIP backbone, using the robustness-augmentation pipeline so the model
+"""Trains the detector using the robustness-augmentation pipeline, so the model
 learns invariance to the challenge's named transforms rather than memorizing
-pristine-image statistics.
+pristine-image statistics. With the default `model.architecture: cnn_transformer`
+this trains the whole model end-to-end (no frozen component); with
+`clip_frozen` it trains only the head (+ optional frequency branch).
+
+Each training sample is loaded as a genuine clean/augmented PAIR (see
+`data.datasets.PairedViewDataset`) so the consistency loss compares the model's
+prediction on an image against its prediction on a redistributed copy of the
+SAME image -- which is the literal "robust under transform" objective from the
+challenge brief, rather than an approximation.
 
 Usage:
     python train.py --config configs/default.yaml
@@ -20,9 +27,12 @@ from torch.utils.data import DataLoader
 from torchvision import transforms as T
 from tqdm import tqdm
 
-from data.datasets import RealFakeImageDataset
+from data.datasets import PairedViewDataset, RealFakeImageDataset
 from data.transforms import RobustnessAugment
 from model.detector import AIGCDetector
+
+CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 
 def set_seed(seed: int):
@@ -34,7 +44,7 @@ def set_seed(seed: int):
 
 def build_transform_pipeline(cfg: dict, augment: bool):
     """PIL -> tensor pipeline, with RobustnessAugment injected before ToTensor when
-    `augment=True` (i.e. for the training split)."""
+    `augment=True`."""
     image_size = cfg["data"]["image_size"]
     ops = []
     if augment:
@@ -42,44 +52,55 @@ def build_transform_pipeline(cfg: dict, augment: bool):
     ops += [
         T.Resize((image_size, image_size)),
         T.ToTensor(),
-        T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                    std=[0.26862954, 0.26130258, 0.27577711]),  # CLIP's normalization
+        T.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
     ]
     return T.Compose(ops)
 
 
-def collate(batch):
+def collate_paired(batch):
+    clean, aug, labels, paths = zip(*batch)
+    return torch.stack(clean), torch.stack(aug), torch.tensor(labels, dtype=torch.float32), list(paths)
+
+
+def collate_single(batch):
     imgs, labels, paths = zip(*batch)
     return torch.stack(imgs), torch.tensor(labels, dtype=torch.float32), list(paths)
 
 
 def train_one_epoch(model, loader, optimizer, device, consistency_weight: float, use_freq_branch: bool):
+    """Each batch contains a clean view and an independently-augmented view of the
+    same images. Both are classified (so the model still learns from clean data,
+    not just augmented data); a consistency term additionally penalizes the model
+    for disagreeing between the two views of the same underlying image -- this
+    directly optimizes the "robust under transform" objective rather than relying
+    on augmentation exposure alone to produce it as a side effect.
+    """
     model.train()
     total_loss = 0.0
-    for imgs, labels, _ in tqdm(loader, desc="train", leave=False):
-        imgs, labels = imgs.to(device), labels.to(device)
-        raw = imgs if use_freq_branch else None
+    for clean_imgs, aug_imgs, labels, _ in tqdm(loader, desc="train", leave=False):
+        clean_imgs = clean_imgs.to(device)
+        aug_imgs = aug_imgs.to(device)
+        labels = labels.to(device)
+        raw_clean = clean_imgs if use_freq_branch else None
+        raw_aug = aug_imgs if use_freq_branch else None
 
-        logits = model(imgs, raw)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        clean_logits = model(clean_imgs, raw_clean)
+        aug_logits = model(aug_imgs, raw_aug)
 
-        # Optional consistency term: encourages similar predictions for a sample
-        # and a freshly-augmented view of it within the same batch, directly
-        # optimizing for the "robust under transform" objective rather than
-        # relying on augmentation exposure alone. Cheap approximation here reuses
-        # the same batch with a second augmentation pass; swap in a paired
-        # clean/augmented dataloader for a stricter version.
+        cls_loss = 0.5 * (
+            F.binary_cross_entropy_with_logits(clean_logits, labels)
+            + F.binary_cross_entropy_with_logits(aug_logits, labels)
+        )
+
+        loss = cls_loss
         if consistency_weight > 0:
-            with torch.no_grad():
-                aug_imgs = imgs  # placeholder: same-batch reuse; see docstring above
-            aug_logits = model(aug_imgs, raw)
-            consistency = F.mse_loss(torch.sigmoid(logits), torch.sigmoid(aug_logits).detach())
+            consistency = F.mse_loss(torch.sigmoid(clean_logits), torch.sigmoid(aug_logits))
             loss = loss + consistency_weight * consistency
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * imgs.size(0)
+        total_loss += loss.item() * clean_imgs.size(0)
     return total_loss / len(loader.dataset)
 
 
@@ -113,22 +134,28 @@ def main():
     dataset_roots = [f"data/raw/{name}" for name in cfg["data"]["train_datasets"]]
     full_dataset = RealFakeImageDataset(dataset_roots, transform=None)
     train_ds, val_ds = full_dataset.split_train_val(cfg["data"]["val_split"], seed=cfg["train"]["seed"])
-    train_ds.transform = build_transform_pipeline(cfg, augment=True)
-    val_ds.transform = build_transform_pipeline(cfg, augment=False)
+
+    clean_transform = build_transform_pipeline(cfg, augment=False)
+    aug_transform = build_transform_pipeline(cfg, augment=True)
+
+    paired_train_ds = PairedViewDataset(train_ds.samples, clean_transform, aug_transform)
+    val_ds.transform = clean_transform  # held-out accuracy tracked on clean data;
+    # eval/robustness_eval.py handles the per-transform-severity breakdown separately.
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["data"]["batch_size"], shuffle=True,
-        num_workers=cfg["data"]["num_workers"], collate_fn=collate,
+        paired_train_ds, batch_size=cfg["data"]["batch_size"], shuffle=True,
+        num_workers=cfg["data"]["num_workers"], collate_fn=collate_paired,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg["data"]["batch_size"], shuffle=False,
-        num_workers=cfg["data"]["num_workers"], collate_fn=collate,
+        num_workers=cfg["data"]["num_workers"], collate_fn=collate_single,
     )
 
     model = AIGCDetector.from_config(cfg["model"]).to(device)
     optimizer = torch.optim.AdamW(
         model.trainable_parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"]
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["train"]["epochs"])
 
     ckpt_dir = Path(cfg["train"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -139,8 +166,10 @@ def main():
             model, train_loader, optimizer, device,
             cfg["train"]["consistency_loss_weight"], cfg["model"]["use_freq_branch"],
         )
+        scheduler.step()
         metrics = evaluate(model, val_loader, device, cfg["model"]["use_freq_branch"])
-        print(f"epoch {epoch}: train_loss={train_loss:.4f} val_accuracy={metrics['val_accuracy']:.4f}")
+        print(f"epoch {epoch}: train_loss={train_loss:.4f} val_accuracy={metrics['val_accuracy']:.4f} "
+              f"lr={scheduler.get_last_lr()[0]:.2e}")
 
         if metrics["val_accuracy"] > best_val_acc:
             best_val_acc = metrics["val_accuracy"]

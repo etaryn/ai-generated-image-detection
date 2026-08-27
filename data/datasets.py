@@ -92,6 +92,34 @@ class RealFakeImageDataset(Dataset):
         return _subset(train_idx), _subset(val_idx)
 
 
+class PairedViewDataset(Dataset):
+    """Wraps a list of (path, label) samples and returns BOTH a clean and an
+    augmented view of the same underlying image per sample.
+
+    This backs train.py's consistency loss: instead of the earlier same-batch
+    stand-in (which compared a batch against itself and taught the model
+    nothing new), each sample now gets a genuine clean/augmented pair so the
+    consistency term actually penalizes the model for predicting differently
+    on a redistributed copy of an image versus the original -- which is the
+    literal "robust under transform" objective from the challenge brief.
+    """
+
+    def __init__(self, samples: list[tuple[Path, int]], clean_transform, aug_transform):
+        self.samples = samples
+        self.clean_transform = clean_transform
+        self.aug_transform = aug_transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        clean = self.clean_transform(img)
+        augmented = self.aug_transform(img)
+        return clean, augmented, label, str(path)
+
+
 class ImageFolderInference(Dataset):
     """Loads all images in a flat directory (no labels) — used by infer.py."""
 
