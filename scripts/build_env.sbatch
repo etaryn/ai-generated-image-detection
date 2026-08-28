@@ -51,9 +51,13 @@ if torch.cuda.is_available():
     print("device:", torch.cuda.get_device_name(0))
 PY
 
+# Marker last, so a concurrent job on this node won't adopt this venv until it is
+# actually complete (see scripts/_bootstrap.sh).
+touch "$VENV/.ready"
+
 # Write to .tmp then rename: a job killed mid-tar would otherwise leave a
 # truncated archive that every later job would fail to unpack.
-tar czf "$ARCHIVE.tmp" -C "$VENV_ROOT" venv
+tar czf "$ARCHIVE.tmp" -C "$VENV_ROOT" --exclude=venv/.ready venv
 mv "$ARCHIVE.tmp" "$ARCHIVE"
 ls -lh "$ARCHIVE"
 echo "done -- later jobs restore this to $VENV"

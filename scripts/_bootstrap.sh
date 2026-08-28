@@ -13,14 +13,19 @@ VENV_ARCHIVE="${VENV_ARCHIVE:-$HOME/venv.tar.gz}"
 
 mkdir -p logs "$LOCAL_ROOT"
 
-if [[ ! -x "$VENV/bin/python" ]]; then
+# The marker is written only after a full extract (or a full build), so a venv
+# that another job is still pip-installing into -- we may share a node with it --
+# is correctly treated as absent rather than used half-built.
+if [[ ! -f "$VENV/.ready" ]]; then
     if [[ ! -f "$VENV_ARCHIVE" ]]; then
         echo "ERROR: $VENV_ARCHIVE not found. Build it first:" >&2
         echo "         sbatch scripts/build_env.sbatch" >&2
         exit 1
     fi
     echo "restoring venv: $VENV_ARCHIVE -> $VENV"
+    rm -rf "$VENV"
     tar xzf "$VENV_ARCHIVE" -C "$LOCAL_ROOT"
+    touch "$VENV/.ready"
 fi
 source "$VENV/bin/activate"
 
