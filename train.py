@@ -68,14 +68,24 @@ def collate_single(batch):
     return torch.stack(imgs), torch.tensor(labels, dtype=torch.float32), list(paths)
 
 
-def train_one_epoch(model, loader, optimizer, device, consistency_weight: float, use_freq_branch: bool):
+def train_one_epoch(model, loader, optimizer, device, consistency_weight: float, use_freq_branch: bool, clip_params=None):
     """Each batch contains a clean view and an independently-augmented view of the
     same images. Both are classified (so the model still learns from clean data,
     not just augmented data); a consistency term additionally penalizes the model
     for disagreeing between the two views of the same underlying image -- this
     directly optimizes the "robust under transform" objective rather than relying
     on augmentation exposure alone to produce it as a side effect.
+
+    `clip_params` is the parameter list to gradient-clip -- passed explicitly
+    (rather than calling `model.trainable_parameters()` internally) so this same
+    function works whether `model` is a plain AIGCDetector (single machine,
+    train.py) or a DistributedDataParallel-wrapped one (train_ddp.py), since DDP
+    doesn't forward arbitrary custom methods the way it forwards forward().
+    Defaults to `model.trainable_parameters()` when omitted, for backward
+    compatibility with the single-machine call site below.
     """
+    if clip_params is None:
+        clip_params = model.trainable_parameters()
     model.train()
     total_loss = 0.0
     for clean_imgs, aug_imgs, labels, _ in tqdm(loader, desc="train", leave=False):
@@ -103,7 +113,7 @@ def train_one_epoch(model, loader, optimizer, device, consistency_weight: float,
         # Clip gradients -- transformers are prone to occasional large-gradient
         # spikes early in training (e.g. from a single hard/mislabeled batch);
         # this keeps one bad batch from derailing the whole run.
-        torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * clean_imgs.size(0)
     return total_loss / len(loader.dataset)
