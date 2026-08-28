@@ -15,9 +15,12 @@ data:
   # in "sid_set"/"cifake"/"wildfake" for an actual training run.
   train_datasets: ["cifake"]     # add "sid_set"/"wildfake" back in once downloaded
   val_split: 0.1                             # held out from train_datasets (in-distribution val)
-  image_size: 224
+  # CIFAKE is natively 32x32 -- 64x64 comfortably exceeds that native
+  # resolution while cutting compute vs. 224x224 by ~12x (must stay in sync
+  # with model.input_image_size below).
+  image_size: 64
   batch_size: 64
-  num_workers: 8
+  num_workers: 4     # reduced from 8 -- lower worker-spawn overhead for a quick run
 
   # NOTE: the WildFake COCO/DALL-E "Validation Dataset" from the challenge brief is
   # demonstration-only and must NOT appear in train_datasets or val_split above.
@@ -52,7 +55,7 @@ model:
   # "clip_frozen" (frozen CLIP backbone + linear head) is kept as an alternative/
   # baseline you can switch back to by changing this one field.
   architecture: "cnn_transformer"   # "cnn_transformer" | "clip_frozen"
-  input_image_size: 224
+  input_image_size: 64   # must match data.image_size above
 
   cnn_transformer:
     # ConvStem: 4 stride-2 stages -> 224/16 = 14x14 grid of feature vectors.
