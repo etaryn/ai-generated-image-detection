@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from pathlib import Path
 
@@ -40,6 +41,20 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def resolve_num_workers(cfg_value: int) -> int:
+    """DataLoader workers, capped by the CPUs the batch scheduler actually gave us.
+
+    Hardcoding num_workers above the cgroup's CPU allocation doesn't buy throughput --
+    the workers just contend for the same cores, and on SLURM an oversubscribed job
+    gets throttled or OOM-killed (each worker is a fork with its own copy of the
+    dataset index).
+    """
+    allocated = os.environ.get("SLURM_CPUS_PER_TASK")
+    if allocated:
+        return max(1, min(int(cfg_value), int(allocated)))
+    return cfg_value
 
 
 def build_transform_pipeline(cfg: dict, augment: bool):
@@ -123,6 +138,17 @@ def evaluate(model, loader, device, use_freq_branch: bool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument(
+        "--data_root",
+        default="data/raw",
+        help="Parent dir holding <dataset_name>/{real,fake}. Override to read from "
+             "node-local scratch instead of network storage.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from checkpoints/last.pt if it exists (walltime limits, requeue).",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -131,7 +157,7 @@ def main():
     set_seed(cfg["train"]["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset_roots = [f"data/raw/{name}" for name in cfg["data"]["train_datasets"]]
+    dataset_roots = [f"{args.data_root}/{name}" for name in cfg["data"]["train_datasets"]]
     full_dataset = RealFakeImageDataset(dataset_roots, transform=None)
     train_ds, val_ds = full_dataset.split_train_val(cfg["data"]["val_split"], seed=cfg["train"]["seed"])
 
@@ -142,13 +168,17 @@ def main():
     val_ds.transform = clean_transform  # held-out accuracy tracked on clean data;
     # eval/robustness_eval.py handles the per-transform-severity breakdown separately.
 
+    num_workers = resolve_num_workers(cfg["data"]["num_workers"])
+    print(f"device={device} num_workers={num_workers} "
+          f"train={len(paired_train_ds)} val={len(val_ds)}")
+
     train_loader = DataLoader(
         paired_train_ds, batch_size=cfg["data"]["batch_size"], shuffle=True,
-        num_workers=cfg["data"]["num_workers"], collate_fn=collate_paired,
+        num_workers=num_workers, collate_fn=collate_paired,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg["data"]["batch_size"], shuffle=False,
-        num_workers=cfg["data"]["num_workers"], collate_fn=collate_single,
+        num_workers=num_workers, collate_fn=collate_single,
     )
 
     model = AIGCDetector.from_config(cfg["model"]).to(device)
@@ -160,8 +190,28 @@ def main():
     ckpt_dir = Path(cfg["train"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_val_acc = 0.0
+    start_epoch = 0
 
-    for epoch in range(cfg["train"]["epochs"]):
+    resume_path = ckpt_dir / "last.pt"
+    if args.resume and resume_path.exists():
+        # weights_only=False: this file holds optimizer/scheduler state and the config
+        # dict, not just tensors. It's our own artifact, not untrusted input.
+        state = torch.load(resume_path, map_location=device, weights_only=False)
+        if state["config"]["model"] != cfg["model"]:
+            raise RuntimeError(
+                f"{resume_path} was trained with a different model config than "
+                f"{args.config}. Resuming would load mismatched weights -- either "
+                "revert the config or move the old checkpoint aside and start fresh."
+            )
+        model.load_state_dict(state["model_state"])
+        optimizer.load_state_dict(state["optimizer_state"])
+        scheduler.load_state_dict(state["scheduler_state"])
+        start_epoch = state["epoch"]
+        best_val_acc = state["best_val_acc"]
+        print(f"resumed from {resume_path}: starting at epoch {start_epoch}, "
+              f"best_val_accuracy={best_val_acc:.4f}")
+
+    for epoch in range(start_epoch, cfg["train"]["epochs"]):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
             cfg["train"]["consistency_loss_weight"], cfg["model"]["use_freq_branch"],
@@ -178,6 +228,24 @@ def main():
                 ckpt_dir / "best.pt",
             )
             print(f"  -> saved new best checkpoint (val_accuracy={best_val_acc:.4f})")
+
+        # Full training state every epoch, so a job killed at the walltime limit (or
+        # requeued after preemption) resumes instead of restarting. Written to a temp
+        # file and renamed: a crash mid-write would otherwise leave a truncated
+        # last.pt that --resume can't load. rename is atomic within a filesystem.
+        tmp_path = ckpt_dir / "last.pt.tmp"
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "epoch": epoch + 1,
+                "best_val_acc": best_val_acc,
+                "config": cfg,
+            },
+            tmp_path,
+        )
+        tmp_path.replace(ckpt_dir / "last.pt")
 
 
 if __name__ == "__main__":
