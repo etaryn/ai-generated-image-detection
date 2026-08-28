@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 from pathlib import Path
 
@@ -99,6 +100,10 @@ def train_one_epoch(model, loader, optimizer, device, consistency_weight: float,
 
         optimizer.zero_grad()
         loss.backward()
+        # Clip gradients -- transformers are prone to occasional large-gradient
+        # spikes early in training (e.g. from a single hard/mislabeled batch);
+        # this keeps one bad batch from derailing the whole run.
+        torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * clean_imgs.size(0)
     return total_loss / len(loader.dataset)
@@ -161,6 +166,12 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_val_acc = 0.0
 
+    # Per-epoch metrics CSV -- lets you plot a loss/accuracy curve later (useful
+    # for the demo video / Devpost writeup) without having to re-parse stdout.
+    log_path = ckpt_dir / "training_log.csv"
+    with open(log_path, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "train_loss", "val_accuracy", "lr"])
+
     for epoch in range(cfg["train"]["epochs"]):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
@@ -168,8 +179,11 @@ def main():
         )
         scheduler.step()
         metrics = evaluate(model, val_loader, device, cfg["model"]["use_freq_branch"])
+        lr = scheduler.get_last_lr()[0]
         print(f"epoch {epoch}: train_loss={train_loss:.4f} val_accuracy={metrics['val_accuracy']:.4f} "
-              f"lr={scheduler.get_last_lr()[0]:.2e}")
+              f"lr={lr:.2e}")
+        with open(log_path, "a", newline="") as f:
+            csv.writer(f).writerow([epoch, train_loss, metrics["val_accuracy"], lr])
 
         if metrics["val_accuracy"] > best_val_acc:
             best_val_acc = metrics["val_accuracy"]
