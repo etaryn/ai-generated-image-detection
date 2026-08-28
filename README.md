@@ -150,6 +150,58 @@ params).
    showing which image regions most influenced the [CLS] token used for the final
    decision (Abnar & Zuidema, "Quantifying Attention Flow in Transformers", 2020).
 
+## Multi-machine distributed training (optional)
+
+If you have multiple machines with GPUs (e.g. three teammates' laptops) and want to
+combine them into **one faster training run** rather than running three separate
+experiments, `train_ddp.py` wraps `train.py`'s training loop in PyTorch
+`DistributedDataParallel` (DDP). Each machine runs one process, the dataset is split
+across them with a `DistributedSampler` (no two machines train on the same images in
+a given epoch), and gradients are synchronized every step so it behaves like one
+larger-batch run on a single machine, just faster.
+
+**Prerequisites (all machines):**
+
+- The **same repo** (same commit) and the **same dataset** laid out at the same
+  relative path (`data/raw/...`) on every machine.
+- The **same Python/torch environment** (same `requirements.txt` installed) on every
+  machine -- DDP is sensitive to version mismatches.
+- All machines able to reach each other over the network on one TCP port (default
+  `29500`). If they're not already on the same LAN/Wi-Fi, install a mesh VPN like
+  Tailscale on all three laptops first -- it's free for personal use and gives each
+  machine a stable IP that works across networks/firewalls without manual
+  port-forwarding.
+- Pick one machine as the "master" (rank 0) and note its Tailscale/LAN IP address.
+
+**Running it.** On each of the 3 laptops, open a terminal in the repo and run (only
+`--node_rank` changes between machines):
+
+```bash
+# Laptop 1 (master, rank 0) -- replace 100.x.y.z with its Tailscale/LAN IP
+torchrun --nnodes=3 --nproc_per_node=1 --node_rank=0 \
+  --master_addr=100.x.y.z --master_port=29500 train_ddp.py --config configs/default.yaml
+
+# Laptop 2 (rank 1) -- same master_addr as above
+torchrun --nnodes=3 --nproc_per_node=1 --node_rank=1 \
+  --master_addr=100.x.y.z --master_port=29500 train_ddp.py --config configs/default.yaml
+
+# Laptop 3 (rank 2) -- same master_addr as above
+torchrun --nnodes=3 --nproc_per_node=1 --node_rank=2 \
+  --master_addr=100.x.y.z --master_port=29500 train_ddp.py --config configs/default.yaml
+```
+
+Start the master (rank 0) first; the other two will wait until they can connect to it.
+Only rank 0 evaluates, prints progress, writes `training_log.csv`, and saves
+`checkpoints/best.pt` -- you only need to watch that machine's terminal for results.
+
+Uses the `gloo` backend (not `nccl`) specifically so this works across mixed
+OSes/GPU vendors (Windows, Mac, Linux, NVIDIA or not) rather than requiring all three
+machines to be Linux+NVIDIA.
+
+If this setup work sounds like more than it's worth for your timeline, the simpler
+alternative is running three **independent** experiments (different configs/seeds, one
+per laptop) with plain `train.py` and comparing results -- no networking required.
+
 ## Running the tests
 
 ```bash
