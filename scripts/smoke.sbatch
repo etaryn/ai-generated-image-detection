@@ -9,24 +9,23 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #
-# Cheap correctness pass before burning a gpu-long allocation. Runs the forward/
-# backward shape test (which has never actually been executed -- see README) and
-# then one epoch on the network-free synthetic dataset.
+# Cheap correctness pass before spending a gpu-long allocation:
+#   1. the forward/backward shape test, which has never actually been executed
+#   2. one epoch on the network-free synthetic dataset
 #
 #   sbatch scripts/smoke.sbatch
 
 set -euo pipefail
 
 REPO="${REPO:-$HOME/ai-generated-image-detection}"
-VENV="${VENV:-$HOME/.venv}"
-
 cd "$REPO"
-mkdir -p logs
-source "$VENV/bin/activate"
+source scripts/_bootstrap.sh
 
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 
 python tests/test_model_shapes.py
-python data/make_synthetic_dataset.py --out data/raw/synthetic --n_per_class 200
-python train.py --config configs/smoke.yaml
+
+# Generated onto node-local /tmp: 400 images in $HOME would be 400 inodes.
+python data/make_synthetic_dataset.py --out "$LOCAL_ROOT/raw/synthetic" --n_per_class 200
+python train.py --config configs/smoke.yaml --data_root "$LOCAL_ROOT/raw"
