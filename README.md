@@ -85,6 +85,44 @@ Requires Python 3.10+. A CUDA GPU is recommended for training the CNN + Transfor
 hybrid end-to-end; CPU inference is feasible given the model's small size (~14M
 params).
 
+## Running the demo UI
+
+The trained weights ship with the repo (`server/model_01/checkpoints/best.pt`), so
+the Streamlit client runs straight after a clone -- no training step first:
+
+```bash
+pip install -r server/requirements.txt   # torch, torchvision, ...
+pip install -r client/requirements.txt   # streamlit
+streamlit run client/app.py
+```
+
+Upload an image and the sidebar sliders apply JPEG compression, blur, crop, colour
+jitter and noise to it live, so you can watch the score move as the image degrades.
+
+To score a folder instead of one upload at a time:
+
+```bash
+cd server/model_01
+python infer.py --input_dir /path/to/images --output predictions.json
+```
+
+Both paths call the same code: `infer.predict_image(pil_image) -> float`, returning
+P(AI-generated) in `[0, 1]`. `--checkpoint` (or `$AIGC_CHECKPOINT`) overrides which
+weights are used; the default is the bundled `best.pt`.
+
+**Don't hardcode an input resolution.** The checkpoint records the size it was
+trained at and `infer.py` reads it from there. The model's positional embedding is a
+fixed-size parameter, so a mismatched input is a shape error rather than a quiet
+drop in accuracy -- the shipped weights are 32px (CIFAKE's native size), not 224.
+
+**On what the score means.** The bundled checkpoint scores 0.9589 accuracy /
+0.9933 AUC on CIFAKE's held-out split, but CIFAKE is 32x32, and every upload is
+resized to 32x32 before scoring. A photo off a phone camera is well outside that
+training distribution, so expect the live demo to be noticeably less accurate than
+those numbers suggest. Training on full-resolution data is the fix; see the
+"full-resolution" comments in `server/model_01/configs/default.yaml` for the fields
+that need changing back.
+
 ## Steps to reproduce results
 
 1. **Get the data.** Run `python data/prepare_data.py --help` for pointers on laying out

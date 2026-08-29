@@ -13,3 +13,9 @@ eval/robustness_matrix.csv
 eval/*.png
 .DS_Store
 .ipynb_checkpoints/
+
+# The released detector weights are an exception to the *.pt rule above: the
+# client needs them to run, so they ship with the repo rather than out of band.
+# Training scratch (last.pt, smoke/, archive-*/) stays ignored.
+!model_01/checkpoints/
+!model_01/checkpoints/best.pt

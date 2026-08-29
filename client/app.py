@@ -50,29 +50,36 @@ def apply_transformations(img, blur, jpeg_q, crop_percent, brightness, contrast,
     return transformed
 
 
+# infer.py lives in the model project, not next to this file.
+MODEL_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "server", "model_01")
+)
+
+
+@st.cache_resource(show_spinner="Loading detector...")
+def _load_backend():
+    """Import the real inference backend, or raise with a usable message.
+
+    Cached so the checkpoint is loaded once per session rather than per upload.
+    """
+    if MODEL_DIR not in sys.path:
+        sys.path.insert(0, MODEL_DIR)
+    import infer  # noqa: E402  -- deliberately imported after the path fix above
+
+    infer.load_model()  # fail here, at startup, rather than on the first upload
+    return infer
+
+
 def run_inference(image):
+    """Score `image` with the trained model. Returns P(AI-generated) in [0, 1].
+
+    There is deliberately no mock fallback. An earlier version scored images with
+    `((mean_pixel * 7) % 100) / 100` whenever the import failed, and swallowed the
+    reason -- which rendered as a confident "AI-Generated, 87.3%" verdict that had
+    never touched the model. A backend that is not wired up must look broken, not
+    look like a working demo.
     """
-    Attempts to import and run your backend inference from infer.py.
-    Falls back to a mock score if infer.py or PyTorch model is not ready.
-    """
-    try:
-        # Add parent folder to path to find infer.py
-        parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        if parent_dir not in sys.path:
-            sys.path.append(parent_dir)
-            
-        import infer
-        if hasattr(infer, "predict_image"):
-            return infer.predict_image(image)
-    except Exception:
-        pass
-    
-    # Mock fallback for UI development
-    # Generates a pseudo-deterministic score based on image pixels for realistic real-time feedback
-    arr = np.array(image, dtype=np.float32)
-    mean_val = float(np.mean(arr))
-    score = ((mean_val * 7) % 100) / 100.0
-    return score
+    return _load_backend().predict_image(image)
 
 
 # --- SIDEBAR CONTROLS ---
@@ -110,7 +117,18 @@ if uploaded:
     )
     
     # Run real-time inference on transformed image
-    score = run_inference(transformed_img)
+    try:
+        score = run_inference(transformed_img)
+    except Exception as exc:
+        st.error(
+            f"**The detector is not available, so no score can be shown.**\n\n"
+            f"`{type(exc).__name__}: {exc}`\n\n"
+            f"Expected the model at `{MODEL_DIR}` and a checkpoint at "
+            f"`server/model_01/checkpoints/best.pt` "
+            f"(or set `$AIGC_CHECKPOINT`). Install the model deps with "
+            f"`pip install -r server/requirements.txt`."
+        )
+        st.stop()
     
     col1, col2 = st.columns([1.2, 1])
     

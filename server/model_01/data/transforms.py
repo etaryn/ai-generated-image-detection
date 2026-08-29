@@ -99,6 +99,11 @@ def center_crop(img: Image.Image, crop_fraction: float = 0.80) -> Image.Image:
     return cropped.resize((w, h), Image.BILINEAR)
 
 
+# Smallest side a downscale round-trip may produce. Below roughly this, an image
+# has too few pixels left for any generator fingerprint to survive the trip back up.
+MIN_SIDE_AFTER_RESIZE = 16
+
+
 # --------------------------------------------------------------------------- #
 # Named severity levels for deterministic evaluation (used by robustness_eval.py)
 # --------------------------------------------------------------------------- #
@@ -182,6 +187,9 @@ class RobustnessAugment:
     center_crop_prob: float = 0.3
     center_crop_fraction: float = 0.80
 
+    # Clamp transform magnitudes to what the image size can survive (see _allowed).
+    resolution_aware: bool = True
+
     @classmethod
     def from_config(cls, cfg: dict) -> "RobustnessAugment":
         """Build from the `augmentation` block of a loaded YAML config."""
@@ -198,21 +206,59 @@ class RobustnessAugment:
             color_jitter_max_delta=cfg["color_jitter"]["max_delta"],
             center_crop_prob=cfg["center_crop"]["prob"],
             center_crop_fraction=cfg["center_crop"]["crop_fraction"],
+            resolution_aware=cfg.get("resolution_aware", True),
         )
 
+    def _allowed(self, min_side: int) -> tuple[list[float], list[float], list[int]]:
+        """Filter transform magnitudes down to what this image size can survive.
+
+        The severities in the config are written for full-resolution photos. On a
+        32x32 CIFAKE image the same numbers are annihilating rather than
+        augmenting: `resize_roundtrip(0.25)` leaves an 8x8 thumbnail and
+        `gaussian_blur(2.0)` leaves a near-uniform patch, so the "augmented view"
+        carries no class information at all. Training on those views supplies half
+        the classification loss from pure noise and makes a constant-0.5 output the
+        cheapest solution -- which is what collapsed job 768468 to exactly ln(2).
+
+        Rather than hardcode a second set of numbers per dataset, scale the limits
+        to the image: never downscale below MIN_SIDE_AFTER_RESIZE pixels, keep the
+        blur kernel small relative to the image, and hold JPEG above the quality
+        where 8x8 block artifacts start dominating a small image.
+        """
+        if not self.resolution_aware:
+            return list(self.resize_scales), list(self.blur_sigmas), list(self.jpeg_qualities)
+
+        scales = [s for s in self.resize_scales if min_side * s >= MIN_SIDE_AFTER_RESIZE]
+        max_sigma = max(0.5, min_side / 112.0)   # 2.0 at 224px, 0.5 at <=56px
+        sigmas = [s for s in self.blur_sigmas if s <= max_sigma]
+        min_quality = 70 if min_side < 64 else 0
+        qualities = [q for q in self.jpeg_qualities if q >= min_quality]
+        return scales, sigmas, qualities
+
     def __call__(self, img: Image.Image) -> Image.Image:
-        if random.random() < self.resize_prob:
-            img = resize_roundtrip(img, random.choice(self.resize_scales))
+        scales, sigmas, qualities = self._allowed(min(img.size))
+
+        if scales and random.random() < self.resize_prob:
+            img = resize_roundtrip(img, random.choice(scales))
         if random.random() < self.center_crop_prob:
             img = center_crop(img, self.center_crop_fraction)
-        if random.random() < self.blur_prob:
-            img = gaussian_blur(img, random.choice(self.blur_sigmas))
+        if sigmas and random.random() < self.blur_prob:
+            img = gaussian_blur(img, random.choice(sigmas))
         if random.random() < self.color_jitter_prob:
             img = color_jitter(img, self.color_jitter_max_delta)
         if random.random() < self.noise_prob:
             img = gaussian_noise(img, random.choice(self.noise_sigmas))
         # JPEG last: re-compressing after other pixel-level ops best matches a real
         # "edited then re-uploaded" pipeline.
-        if random.random() < self.jpeg_prob:
-            img = jpeg_compress(img, random.choice(self.jpeg_qualities))
+        if qualities and random.random() < self.jpeg_prob:
+            img = jpeg_compress(img, random.choice(qualities))
         return img
+
+    def describe_for_size(self, min_side: int) -> str:
+        """What this augmenter will actually do at a given image size (for logging)."""
+        scales, sigmas, qualities = self._allowed(min_side)
+        return (f"resize_scales={scales or 'DISABLED'} blur_sigmas={sigmas or 'DISABLED'} "
+                f"jpeg_qualities={qualities or 'DISABLED'} "
+                f"noise_sigmas={self.noise_sigmas} "
+                f"color_jitter=+/-{self.color_jitter_max_delta} "
+                f"center_crop={self.center_crop_fraction}")

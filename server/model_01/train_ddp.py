@@ -153,11 +153,15 @@ def main():
 
     for epoch in range(cfg["train"]["epochs"]):
         train_sampler.set_epoch(epoch)  # re-shuffle differently each epoch; without this every epoch sees the same shard order
-        train_loss = train_one_epoch(
+        # train_one_epoch returns a dict of per-epoch diagnostics (loss, accuracy,
+        # mean grad norm, ...), not a bare float.
+        train_stats = train_one_epoch(
             ddp_model, train_loader, optimizer, device,
             cfg["train"]["consistency_loss_weight"], cfg["model"]["use_freq_branch"],
+            grad_clip_norm=cfg["train"].get("grad_clip_norm", 1.0) or 0.0,
             clip_params=model.trainable_parameters(),  # unwrapped model -- DDP doesn't forward custom methods
         )
+        train_loss = train_stats["train_loss"]
         scheduler.step()
 
         dist.barrier()  # keep ranks roughly in step before rank 0's (potentially slow) eval/save

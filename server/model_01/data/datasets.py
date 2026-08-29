@@ -45,21 +45,65 @@ class RealFakeImageDataset(Dataset):
         self,
         dataset_roots: list[str | Path],
         transform: Optional[Callable[[Image.Image], object]] = None,
+        strict: bool = True,
     ):
         self.transform = transform
         self.samples: list[tuple[Path, int]] = []
+        self.per_dataset_counts: dict[str, dict[str, int]] = {}
 
+        problems: list[str] = []
         for root in dataset_roots:
             root = Path(root)
+            counts = {"real": 0, "fake": 0}
             for label, subdir in ((0, "real"), (1, "fake")):
-                for img_path in _list_images(root / subdir):
+                found = _list_images(root / subdir)
+                counts[subdir] = len(found)
+                for img_path in found:
                     self.samples.append((img_path, label))
+            self.per_dataset_counts[str(root)] = counts
+
+            # A dataset listed in the config but absent (or empty) on disk used to
+            # contribute zero images in total silence, so a run would train on less
+            # data than the config claimed and nothing in the logs would say so --
+            # that is exactly what happened to "sid_set" in job 768468.
+            if not root.exists():
+                problems.append(f"  {root}: does not exist")
+            elif counts["real"] == 0 and counts["fake"] == 0:
+                problems.append(f"  {root}: exists but contains no images under real/ or fake/")
+            elif counts["real"] == 0 or counts["fake"] == 0:
+                problems.append(
+                    f"  {root}: one-sided -- real={counts['real']} fake={counts['fake']} "
+                    "(a single-class dataset cannot train a binary classifier)"
+                )
+
+        if problems and strict:
+            raise RuntimeError(
+                "Dataset roots are missing, empty, or single-class:\n"
+                + "\n".join(problems)
+                + "\n\nRun data/prepare_data.py to lay them out, remove them from "
+                "`data.train_datasets` in the config, or pass strict=False to load "
+                "whatever is present. Refusing to train on silently-reduced data."
+            )
+        for problem in problems:
+            print(f"WARNING: dataset root problem:{problem}")
 
         if not self.samples:
             raise RuntimeError(
                 f"No images found under {dataset_roots}. Run data/prepare_data.py "
                 "first to download and lay out the datasets."
             )
+
+    def describe(self) -> str:
+        """Per-dataset and overall class counts, for logging at startup."""
+        lines = []
+        for root, counts in self.per_dataset_counts.items():
+            lines.append(f"  {root}: real={counts['real']} fake={counts['fake']}")
+        n_fake = sum(label for _, label in self.samples)
+        n_real = len(self.samples) - n_fake
+        balance = n_fake / len(self.samples) if self.samples else float("nan")
+        lines.append(f"  TOTAL: real={n_real} fake={n_fake} n={len(self.samples)} "
+                     f"fake_fraction={balance:.4f}")
+        return "\n".join(lines)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -86,6 +130,7 @@ class RealFakeImageDataset(Dataset):
         def _subset(idx_set):
             ds = RealFakeImageDataset.__new__(RealFakeImageDataset)
             ds.transform = self.transform
+            ds.per_dataset_counts = self.per_dataset_counts
             ds.samples = [s for i, s in enumerate(self.samples) if i in idx_set]
             return ds
 

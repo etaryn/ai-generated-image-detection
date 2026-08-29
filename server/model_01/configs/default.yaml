@@ -1,18 +1,24 @@
 # Default configuration for the AIGC detector.
-# Override any of these on the command line, e.g.:
-#   python train.py --config configs/default.yaml --model.backbone_name ViT-L-14
+#
+# Tuned for CIFAKE, which is 32x32. Job 768468 trained this at image_size 224 --
+# upsampling a 32px image to 224 and then running it through a stride-16 stem
+# reduced it to a 14x14 grid, destroying the high-frequency generator fingerprint
+# that makes CIFAKE separable in the first place. It never learned (best val
+# accuracy 0.5797, loss floored at ln(2)). Everything below is set for native
+# resolution instead. If you switch to a full-resolution dataset, see the
+# "full-resolution" comments on each field that needs to change back.
 
 data:
   # Where prepare_data.py lays out each dataset:
   #   data/raw/<dataset_name>/real/*.jpg
   #   data/raw/<dataset_name>/fake/*.jpg
-  # "synthetic" (data/make_synthetic_dataset.py) is a network-free stand-in for
-  # smoke-testing the pipeline before real data is downloaded/laid out -- swap
-  # in "sid_set"/"cifake"/"wildfake" for an actual training run.
-  train_datasets: ["cifake"]     # add "sid_set"/"wildfake" back in once downloaded
+  # Every name listed here MUST exist on disk with both real/ and fake/ populated --
+  # RealFakeImageDataset now raises instead of silently contributing zero images
+  # (job 768468 listed "sid_set" and trained without it, with no log line saying so).
+  train_datasets: ["cifake"]
   val_split: 0.1                             # held out from train_datasets (in-distribution val)
-  image_size: 224
-  batch_size: 64
+  image_size: 32                             # CIFAKE native. Full-resolution data: 224.
+  batch_size: 256                            # 32px is ~49x cheaper per image than 224px
   num_workers: 8
 
   # NOTE: the WildFake COCO/DALL-E "Validation Dataset" from the challenge brief is
@@ -24,15 +30,22 @@ data:
 augmentation:
   # Probabilities are independent per-sample; transforms can stack, matching the
   # challenge's "subset of the following augmentations" robustness framing.
+  #
+  # The magnitudes below are written for full-resolution photos. `resolution_aware`
+  # clamps them per-image at augmentation time (see RobustnessAugment._allowed), so
+  # a 32px image never gets downscaled to 8px or blurred into a flat patch. Leave it
+  # on: those annihilating views are half the classification loss, and they are what
+  # made a constant 0.5 output the cheapest solution in job 768468.
+  resolution_aware: true
   jpeg:
     prob: 0.5
-    qualities: [90, 70, 50, 30]
+    qualities: [90, 70, 50, 30]     # clamped to >=70 below 64px
   gaussian_blur:
     prob: 0.4
-    sigmas: [0.5, 1.0, 2.0]
+    sigmas: [0.5, 1.0, 2.0]         # clamped to <= min_side/112 (so 0.5 only at 32px)
   resize_roundtrip:
     prob: 0.4
-    scales: [0.5, 0.25]
+    scales: [0.5, 0.25]             # clamped so the downscale never goes below 16px
   gaussian_noise:
     prob: 0.4
     sigmas: [0.02, 0.05, 0.10]
@@ -48,21 +61,23 @@ model:
   # "clip_frozen" (frozen CLIP backbone + linear head) is kept as an alternative/
   # baseline you can switch back to by changing this one field.
   architecture: "cnn_transformer"   # "cnn_transformer" | "clip_frozen"
-  input_image_size: 224
+  input_image_size: 32              # must equal data.image_size
 
   cnn_transformer:
-    # ConvStem: 4 stride-2 stages -> 224/16 = 14x14 grid of feature vectors.
-    stem_channels: [64, 128, 256, 384]
+    # ConvStem stages are stride-2 each, so total stride = 2**len(stem_channels) and
+    # the token grid is input_image_size / stride. Two stages at 32px gives an
+    # 8x8 = 64-token grid; four stages would give 2x2 = 4 tokens, far too few for
+    # self-attention to do anything useful.
+    #   32px  -> [64, 128]             (stride 4,  8x8 = 64 tokens)
+    #   224px -> [64, 128, 256, 384]   (stride 16, 14x14 = 196 tokens)
+    stem_channels: [64, 128]
     # TokenTransformer: standard multi-head self-attention encoder over the
     # CNN's local feature tokens (+ a learnable [CLS] token for pooling).
-    transformer_dim: 384
+    transformer_dim: 256
     transformer_depth: 6
-    transformer_heads: 6
+    transformer_heads: 8            # must divide transformer_dim
     transformer_mlp_ratio: 4.0
     dropout: 0.1
-    # Trainable end-to-end (no frozen component) -> total params ~14M,
-    # far under the challenge's 2B limit, but expect to need more epochs/data
-    # than the frozen-backbone baseline since there's no pretraining to lean on.
 
   clip_frozen:
     backbone_name: "ViT-B-16"     # or "ViT-L-14" if compute allows; both well under 2B params
@@ -74,10 +89,28 @@ model:
   head_dropout: 0.2
 
 train:
-  epochs: 15
-  lr: 1.0e-3
+  epochs: 30                     # 32px epochs are minutes, not the ~7min/epoch of 224px
+  lr: 3.0e-4                     # was 1e-3: too hot for a from-scratch transformer
   weight_decay: 1.0e-4
-  consistency_loss_weight: 0.5   # weight on clean-vs-augmented logit consistency loss
+  warmup_epochs: 3               # linear LR warmup before the cosine decay. Without it
+                                 # the model diverged between epoch 0 and 1 in job 768468.
+  grad_clip_norm: 1.0            # 0 or null disables
+
+  consistency_loss_weight: 0.5   # weight on clean-vs-augmented prediction consistency
+  consistency_warmup_epochs: 3   # ramp the weight 0 -> target over these epochs. Applied
+                                 # from step 0, this term rewards a constant output (it is
+                                 # trivially satisfied by predicting the same thing twice)
+                                 # before the classifier has any signal to preserve.
+
+  # Abort if the model emits a near-constant prediction for this many epochs in a
+  # row -- the ln(2) collapse. Fails in minutes instead of burning the allocation.
+  collapse_std_threshold: 0.02
+  collapse_patience: 2
+  collapse_grace_epochs: 3       # don't arm the detector before this epoch -- a healthy
+                                 # model is legitimately near-constant while it learns
+                                 # the base rate. Abort also requires AUC < 0.55, so a
+                                 # merely badly-scaled model is never killed.
+
   checkpoint_dir: "checkpoints/"
   log_every: 50
   seed: 42
