@@ -1,0 +1,106 @@
+# QUICK SMOKE-TEST configuration for model_02 -- same pipeline as default.yaml,
+# sized to answer one question fast: does extraction -> cache -> classifier ->
+# checkpoint -> inference actually run end to end on real data?
+#
+# Usage (pair the --limit with it; the config can't cap the image count itself):
+#   python extract_features.py --config configs/quick_smoke.yaml --limit 2000
+#   python train.py --config configs/quick_smoke.yaml
+#
+# Note what is NOT reduced: the two backbones. Swapping DINOv2/CLIP for smaller
+# variants would smoke-test a different pipeline than the one being shipped, so
+# the run stays cheap by cutting image count and epochs instead.
+
+data:
+  data_root: "../../data/raw"
+  train_datasets: ["cifake"]
+  val_split: 0.1
+  # CIFAKE is natively 32x32, so a 128 canonical size is already well past its
+  # real resolution while roughly quartering the FFT block's cost vs. 256.
+  canonical_size: 128
+  batch_size: 64
+  num_workers: 4
+
+  demo_eval_set:
+    real_dir: "../../data/raw/wildfake_demo/coco_val2017"
+    fake_dir: "../../data/raw/wildfake_demo/dalle_advanced"
+
+augmentation:
+  jpeg:
+    prob: 0.5
+    qualities: [90, 70, 50, 30]
+  gaussian_blur:
+    prob: 0.4
+    sigmas: [0.5, 1.0, 2.0]
+  resize_roundtrip:
+    prob: 0.4
+    scales: [0.5, 0.25]
+  gaussian_noise:
+    prob: 0.4
+    sigmas: [0.02, 0.05, 0.10]
+  color_jitter:
+    prob: 0.4
+    max_delta: 0.20
+  center_crop:
+    prob: 0.3
+    crop_fraction: 0.80
+
+features:
+  cache_dir: "features/cache"
+  cache_name: "smoke_cifake.npz"     # separate file so it can't be mistaken for a real cache
+  train_aug_copies: 1
+
+  dinov2:
+    enabled: true
+    model_name: "facebook/dinov2-base"
+    image_size: 224
+    pooling: "cls_mean"
+    l2_normalize: true
+
+  clip:
+    enabled: true
+    backbone_name: "ViT-B-16"
+    pretrained: "openai"
+    image_size: 224
+    l2_normalize: true
+
+  fft:
+    enabled: true
+    work_size: 128                   # must be <= canonical_size to mean anything
+    n_radial_bins: 32
+    n_angular_bins: 16
+    blur_sigma: 1.0
+    n_threads: 4
+
+classifier:
+  type: "mlp"
+
+  mlp:
+    hidden_dims: [256, 64]
+    dropout: 0.3
+    epochs: 5                        # just enough to prove the loss moves
+    batch_size: 256
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    early_stopping_patience: 0       # 0 = never stop early on a 5-epoch run
+
+  xgboost:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1.0
+    reg_lambda: 1.0
+    early_stopping_rounds: 20
+    tree_method: "hist"
+    verbose_eval: 20
+
+train:
+  checkpoint_dir: "checkpoints_smoke/"   # separate dir so this can't clobber a real run
+  seed: 42
+
+eval:
+  threshold: 0.5
+  target_fpr: 0.05
+  severities: ["clean", "jpeg_q30", "resize_0.25x", "compound_severe"]
+  output_dir: "eval/outputs_smoke/"

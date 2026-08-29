@@ -1,0 +1,138 @@
+# Default configuration for model_02 (frozen features -> small classifier).
+#
+# Pipeline this config drives:
+#   Step 1  extract_features.py  images -> [DINOv2 | CLIP | FFT stats] -> cached .npz
+#   Step 2  train.py             cached features -> MLP or XGBoost -> P(AI-generated)
+#
+# Override anything on the command line where a flag exists (--classifier,
+# --blocks, --aug-copies, --limit); everything else is edited here.
+
+data:
+  # model_02 lives at server/model_02/, the datasets at the repo root, so paths
+  # are relative to this directory. Layout is model_01's:
+  #   <data_root>/<dataset_name>/real/*.jpg
+  #   <data_root>/<dataset_name>/fake/*.jpg
+  data_root: "../../data/raw"
+  train_datasets: ["cifake"]     # add "sid_set"/"wildfake" once downloaded
+  val_split: 0.1                 # held out from train_datasets, split BY SOURCE IMAGE
+  # One decode+resize per image feeds all three extractors (see data_io.py).
+  # 256 keeps enough resolution for the FFT block to see a real high-frequency
+  # band while staying cheap; DINOv2/CLIP resample from this to 224.
+  canonical_size: 256
+  batch_size: 64
+  num_workers: 8
+
+  # The WildFake COCO/DALL-E subset from the challenge brief is demonstration-only
+  # and must NEVER appear in train_datasets. extract_features.py --demo-eval-set
+  # and eval/robustness_eval.py read it from here.
+  demo_eval_set:
+    real_dir: "../../data/raw/wildfake_demo/coco_val2017"
+    fake_dir: "../../data/raw/wildfake_demo/dalle_advanced"
+
+augmentation:
+  # Same transform family and probabilities as model_01 -- these are consumed by
+  # model_01's RobustnessAugment (via shared.py) when building augmented copies
+  # for the feature cache, so both models train against identical redistribution.
+  jpeg:
+    prob: 0.5
+    qualities: [90, 70, 50, 30]
+  gaussian_blur:
+    prob: 0.4
+    sigmas: [0.5, 1.0, 2.0]
+  resize_roundtrip:
+    prob: 0.4
+    scales: [0.5, 0.25]
+  gaussian_noise:
+    prob: 0.4
+    sigmas: [0.02, 0.05, 0.10]
+  color_jitter:
+    prob: 0.4
+    max_delta: 0.20
+  center_crop:
+    prob: 0.3
+    crop_fraction: 0.80
+
+features:
+  cache_dir: "features/cache"
+  cache_name: "train_cifake.npz"
+
+  # Extra augmented rows per source image. This is model_02's substitute for
+  # model_01's clean/augmented consistency loss: with a frozen extractor there's
+  # no end-to-end loss to attach a consistency term to, so invariance has to come
+  # from the classifier seeing both versions. 1 doubles extraction time; 0 makes
+  # a clean-only cache (fine for the demo/eval caches).
+  train_aug_copies: 1
+
+  # --- Step 1a: texture / structure ---------------------------------------- #
+  dinov2:
+    enabled: true
+    model_name: "facebook/dinov2-base"   # ~86M params, frozen
+    image_size: 224                      # must be a multiple of 14 (DINOv2 patch size)
+    pooling: "cls_mean"                  # "cls" | "mean" | "cls_mean" -> 768 or 1536 dims
+    l2_normalize: true
+
+  # --- Step 1b: semantics / logic ------------------------------------------ #
+  clip:
+    enabled: true
+    backbone_name: "ViT-B-16"            # ~86M params, frozen; "ViT-L-14" if compute allows
+    pretrained: "openai"
+    image_size: 224
+    l2_normalize: true                   # 512 dims for ViT-B-16
+
+  # --- Step 1c: microscopic pixel noise ------------------------------------ #
+  fft:
+    enabled: true
+    work_size: 256                       # spectral analysis resolution
+    n_radial_bins: 32
+    n_angular_bins: 16
+    blur_sigma: 1.0                      # high-pass residual = image - blur(image)
+    n_threads: 4                         # CPU threads; this block is the CPU-bound one
+    # -> 130 dims. Total default vector: 1536 + 512 + 130 = 2178.
+
+classifier:
+  type: "mlp"                            # "mlp" | "xgboost"
+
+  mlp:
+    hidden_dims: [512, 128]
+    dropout: 0.3
+    epochs: 40
+    batch_size: 256
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    early_stopping_patience: 8           # on validation AUC
+
+  xgboost:
+    n_estimators: 800
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1.0
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+    tree_method: "hist"
+    verbose_eval: 50
+
+train:
+  checkpoint_dir: "checkpoints/"
+  seed: 42
+
+eval:
+  threshold: 0.5                         # default decision threshold
+  target_fpr: 0.05                       # train.py also calibrates a threshold to this budget
+  # "all" expands to every entry in model_01's SEVERITY_LEVELS. Listed explicitly
+  # here to keep the default robustness run affordable -- model_02 re-extracts
+  # features per severity, which is far more expensive than model_01's re-scoring.
+  severities:
+    - "clean"
+    - "jpeg_q70"
+    - "jpeg_q30"
+    - "blur_s1.0"
+    - "resize_0.5x"
+    - "resize_0.25x"
+    - "noise_s0.05"
+    - "color_jitter_20pct"
+    - "center_crop_80pct"
+    - "compound_moderate"
+    - "compound_severe"
+  output_dir: "eval/outputs/"

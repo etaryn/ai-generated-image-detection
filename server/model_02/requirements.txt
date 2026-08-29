@@ -1,0 +1,24 @@
+# model_02 = frozen-feature pipeline (DINOv2 + CLIP + FFT stats -> small classifier).
+# Everything in ../requirements.txt still applies; these are the additions/notes.
+
+# Feature extractors
+transformers>=4.40        # DINOv2 (facebook/dinov2-base); also the CLIP fallback
+open_clip_torch>=2.24     # preferred CLIP implementation (matches model_01/model/backbone.py)
+torch>=2.1
+torchvision>=0.16
+
+# FFT / hand-crafted spectral statistics
+numpy>=1.26
+scipy>=1.11               # scipy.fft (block DCT), scipy.ndimage (blur), scipy.stats (skew/kurtosis)
+
+# Classifiers
+scikit-learn>=1.4
+xgboost>=2.0              # only needed when classifier.type == "xgboost"
+
+# Config / IO / reporting
+PyYAML>=6.0
+tqdm>=4.66
+pandas>=2.2
+matplotlib>=3.8
+seaborn>=0.13
+Pillow>=10.0

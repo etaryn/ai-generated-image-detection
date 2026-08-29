@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+features/cache/
+checkpoints/
+checkpoints_smoke/
+*.ckpt
+*.pt
+*.npz
+outputs/
+predictions.json
+eval/outputs/
+eval/*.png
+eval/*.csv
+.DS_Store
