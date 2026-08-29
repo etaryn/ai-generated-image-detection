@@ -1,0 +1,7 @@
+# Streamlit demo UI (client/app.py).
+#
+# The client also needs the model itself importable -- install
+# server/requirements.txt as well, which brings in torch/torchvision.
+streamlit>=1.30
+Pillow>=10.0
+numpy>=1.26

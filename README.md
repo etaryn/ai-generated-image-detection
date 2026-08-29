@@ -92,7 +92,7 @@ the Streamlit client runs straight after a clone -- no training step first:
 
 ```bash
 pip install -r server/requirements.txt   # torch, torchvision, ...
-pip install streamlit
+pip install -r client/requirements.txt   # streamlit
 streamlit run client/app.py
 ```
 
