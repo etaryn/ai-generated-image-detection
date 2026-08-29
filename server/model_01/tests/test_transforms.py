@@ -19,7 +19,9 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root on sys.path
 
 from data.transforms import (  # noqa: E402
+    MIN_SIDE_AFTER_RESIZE,
     SEVERITY_LEVELS,
+    RobustnessAugment,
     apply_named_transform,
     center_crop,
     color_jitter,
@@ -165,6 +167,87 @@ def test_unknown_severity_raises():
     else:
         raise AssertionError("apply_named_transform should raise KeyError for an unknown severity name")
 
+
+
+# --------------------------------------------------------------------------- #
+# Resolution-aware severity clamping (RobustnessAugment._allowed)
+# --------------------------------------------------------------------------- #
+# The configured severities are written for full-resolution photos. Applied
+# unchanged to CIFAKE's 32x32 images they are annihilating rather than
+# augmenting, which is what let a constant-0.5 output become the cheapest
+# solution in job 768468. These lock in that the clamping fires at small sizes
+# and stays out of the way at full resolution.
+
+
+def _default_augmenter(**overrides) -> RobustnessAugment:
+    return RobustnessAugment(**overrides)
+
+
+def test_resolution_clamp_disables_destructive_ops_at_32px():
+    aug = _default_augmenter()
+    scales, sigmas, qualities = aug._allowed(32)
+    assert 0.25 not in scales, "0.25x on a 32px image leaves an 8x8 thumbnail"
+    assert all(min_side * s >= MIN_SIDE_AFTER_RESIZE for s in scales for min_side in [32])
+    assert sigmas == [0.5], f"only the smallest blur should survive at 32px, got {sigmas}"
+    assert min(qualities) >= 70, f"harsh JPEG should be filtered at 32px, got {qualities}"
+
+
+def test_resolution_clamp_is_a_noop_at_full_resolution():
+    aug = _default_augmenter()
+    scales, sigmas, qualities = aug._allowed(224)
+    assert scales == [0.5, 0.25]
+    assert sigmas == [0.5, 1.0, 2.0]
+    assert qualities == [90, 70, 50, 30]
+
+
+def test_resolution_clamp_scales_monotonically_with_size():
+    """Bigger images may use strictly more of the severity range, never less."""
+    aug = _default_augmenter()
+    prev = None
+    for size in (32, 64, 112, 224):
+        scales, sigmas, qualities = aug._allowed(size)
+        current = (len(scales), len(sigmas), len(qualities))
+        if prev is not None:
+            assert all(c >= p for c, p in zip(current, prev)), (
+                f"severity range shrank going from a smaller size to {size}px"
+            )
+        prev = current
+
+
+def test_resolution_aware_can_be_disabled():
+    """The escape hatch must restore the exact pre-clamping behaviour."""
+    aug = _default_augmenter(resolution_aware=False)
+    scales, sigmas, qualities = aug._allowed(32)
+    assert scales == [0.5, 0.25]
+    assert sigmas == [0.5, 1.0, 2.0]
+    assert qualities == [90, 70, 50, 30]
+
+
+def test_augmented_32px_image_keeps_size_and_does_not_go_flat():
+    """The augmented view must still carry information -- it supplies half the
+    classification loss, so a flat output is actively harmful, not just useless."""
+    img = _make_test_image(size=(32, 32))
+    aug = _default_augmenter()
+    for _ in range(100):
+        out = aug(img)
+        assert out.size == (32, 32)
+        arr = np.asarray(out).astype(np.float32)
+        assert arr.std() > 1.0, f"augmented 32px view collapsed to near-flat (std={arr.std():.3f})"
+
+
+def test_augmented_224px_image_keeps_size():
+    img = _make_test_image(size=(224, 224))
+    aug = _default_augmenter()
+    for _ in range(20):
+        out = aug(img)
+        assert out.size == (224, 224)
+
+
+def test_describe_for_size_reports_disabled_transforms():
+    """train.py logs this at startup, so a silently-disabled transform is visible."""
+    aug = _default_augmenter(blur_sigmas=[2.0], resize_scales=[0.25])
+    described = aug.describe_for_size(32)
+    assert "DISABLED" in described, f"expected a DISABLED marker, got: {described}"
 
 if __name__ == "__main__":
     # Pytest-free runner: discover and run every test_* function in this module.

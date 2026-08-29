@@ -1,0 +1,84 @@
+# Smoke-test config: synthetic data, 1 epoch, separate checkpoint dir.
+# Proves the pipeline runs end-to-end. Says NOTHING about accuracy.
+#
+# Deliberately left at 224px with the 4-stage stem, so the smoke test exercises
+# the FULL-RESOLUTION path while configs/default.yaml runs CIFAKE at native 32px.
+# Between the two, both stem/resolution combinations get executed before a real run.
+
+data:
+  train_datasets: ["synthetic"]
+  val_split: 0.1
+  image_size: 224
+  batch_size: 32
+  num_workers: 4
+
+  demo_eval_set:
+    real_dir: "data/raw/wildfake_demo/coco_val2017"
+    fake_dir: "data/raw/wildfake_demo/dalle_advanced"
+
+augmentation:
+  resolution_aware: true
+  jpeg:
+    prob: 0.5
+    qualities: [90, 70, 50, 30]
+  gaussian_blur:
+    prob: 0.4
+    sigmas: [0.5, 1.0, 2.0]
+  resize_roundtrip:
+    prob: 0.4
+    scales: [0.5, 0.25]
+  gaussian_noise:
+    prob: 0.4
+    sigmas: [0.02, 0.05, 0.10]
+  color_jitter:
+    prob: 0.4
+    max_delta: 0.20
+  center_crop:
+    prob: 0.3
+    crop_fraction: 0.80
+
+model:
+  architecture: "cnn_transformer"
+  input_image_size: 224
+
+  cnn_transformer:
+    stem_channels: [64, 128, 256, 384]   # stride 16 -> 14x14 = 196 tokens at 224px
+    transformer_dim: 384
+    transformer_depth: 6
+    transformer_heads: 6
+    transformer_mlp_ratio: 4.0
+    dropout: 0.1
+
+  clip_frozen:
+    backbone_name: "ViT-B-16"
+    pretrained: "openai"
+    freeze_backbone: true
+
+  use_freq_branch: false
+  head_hidden_dim: 256
+  head_dropout: 0.2
+
+train:
+  epochs: 1
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  grad_clip_norm: 1.0
+  consistency_loss_weight: 0.5
+  consistency_warmup_epochs: 1
+  # One epoch can't trip a 2-epoch patience; the keys are here so the smoke config
+  # stays a valid input to the same code path as default.yaml.
+  collapse_std_threshold: 0.02
+  collapse_patience: 2
+  collapse_grace_epochs: 3       # don't arm the detector before this epoch -- a healthy
+                                 # model is legitimately near-constant while it learns
+                                 # the base rate. Abort also requires AUC < 0.55, so a
+                                 # merely badly-scaled model is never killed.
+  checkpoint_dir: "checkpoints/smoke/"
+  log_every: 50
+  seed: 42
+
+eval:
+  threshold: 0.5
+  severities: ["clean", "mild", "moderate", "severe"]
+  output_dir: "eval/outputs/"
