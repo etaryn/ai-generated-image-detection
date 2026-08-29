@@ -4,6 +4,7 @@ __pycache__/
 .env
 data/raw/
 data/cache/
+**/data/raw/
 checkpoints/
 checkpoints_smoke/
 *.ckpt
@@ -14,3 +15,4 @@ eval/robustness_matrix.csv
 eval/*.png
 .DS_Store
 .ipynb_checkpoints/
+slurm_logs/
