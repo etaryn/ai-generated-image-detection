@@ -13,14 +13,21 @@ Everything needed to reproduce training-time preprocessing lives in the
 checkpoint -- the feature config, the canonical resolution, the column selection
 and the scaler -- so this script takes no feature flags of its own.
 
+Also exposes `predict_image(pil_image) -> float`, and its batch sibling
+`predict_images`, for single-image callers such as the Streamlit client in
+../../client/app.py, which needs a score per upload rather than a batch job over
+a directory. The signature matches model_01/infer.py's so a caller can switch
+which model it imports without changing how it calls it.
+
 Usage:
-    python infer.py --input_dir /path/to/images --checkpoint checkpoints/best.pt \\
+    python infer.py --input_dir /path/to/images --checkpoint checkpoints/best.pt \
         --output predictions.json
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -29,8 +36,88 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from classifiers import load_predictor
-from data_io import CanonicalInferenceDataset, collate_unlabeled
+from data_io import CanonicalInferenceDataset, canonical_transform, collate_unlabeled
 from features.pipeline import FeatureStack
+
+DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "best.pt"
+
+# Building the stack instantiates (and on a cold cache downloads) the frozen
+# DINOv2/CLIP backbones, which is far too slow to redo per upload, so the loaded
+# bundle is cached and reused across calls.
+_LOADED: dict = {}
+
+
+def load_model(
+    checkpoint: str | Path | None = None,
+    device: str | torch.device | None = None,
+):
+    """Load a checkpoint and return (bundle, stack, predictor, device).
+
+    The checkpoint is self-contained -- it carries the feature config, the
+    canonical resolution, the trained column selection and the scaler -- so the
+    extractor stack is rebuilt from the file rather than from a config that may
+    have moved on since the run.
+    """
+    checkpoint = Path(
+        checkpoint or os.environ.get("AIGC_MODEL02_CHECKPOINT") or DEFAULT_CHECKPOINT
+    )
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"No checkpoint at {checkpoint}. Pass one explicitly, or set "
+            f"$AIGC_MODEL02_CHECKPOINT to point at your .pt file."
+        )
+
+    device = str(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    key = (str(checkpoint.resolve()), device)
+    if key in _LOADED:
+        return _LOADED[key]
+
+    # weights_only=False: the bundle intentionally carries the scaler arrays, the
+    # feature config and (for xgboost) the raw booster bytes, not just tensors.
+    bundle = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    stack = FeatureStack.from_config(bundle["features_config"], device=device)
+    predictor = load_predictor(bundle)
+
+    _LOADED[key] = (bundle, stack, predictor, device)
+    return _LOADED[key]
+
+
+def apply_checkpoint_preprocessing(X: np.ndarray, bundle: dict) -> np.ndarray:
+    """Narrow raw features to the trained columns and apply the training scaler."""
+    columns = bundle.get("feature_columns")
+    if columns is not None:
+        if X.shape[1] <= max(columns):
+            raise RuntimeError(
+                f"The checkpoint expects a {max(columns) + 1}-dim feature vector but the "
+                f"rebuilt extractor stack produced {X.shape[1]}. The checkpoint's "
+                f"features_config and the installed extractors have diverged."
+            )
+        X = X[:, columns]
+
+    scaler = bundle["scaler"]
+    return ((X - scaler["mean"]) / scaler["std"]).astype(np.float32)
+
+
+@torch.no_grad()
+def predict_images(images, checkpoint: str | Path | None = None) -> list[float]:
+    """Score a list of PIL images. Returns P(AI-generated) in [0, 1] for each.
+
+    Batched into a single pass through the frozen extractors, so scoring N
+    transformed copies of one upload costs one pass rather than N.
+    """
+    bundle, stack, predictor, _ = load_model(checkpoint)
+    to_canonical = canonical_transform(bundle["canonical_size"])
+    batch = torch.stack([to_canonical(img.convert("RGB")) for img in images])
+    X = apply_checkpoint_preprocessing(stack(batch), bundle)
+    return [float(p) for p in predictor(X)]
+
+
+def predict_image(image, checkpoint: str | Path | None = None) -> float:
+    """Score one PIL image. Returns P(AI-generated) in [0, 1].
+
+    This is the single-image entry point the Streamlit client calls.
+    """
+    return predict_images([image], checkpoint)[0]
 
 
 @torch.no_grad()
@@ -45,7 +132,8 @@ def extract_features(stack: FeatureStack, loader: DataLoader) -> tuple[np.ndarra
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input_dir", required=True, help="Directory of images to score")
-    parser.add_argument("--checkpoint", required=True, help="Path to a train.py checkpoint (.pt)")
+    parser.add_argument("--checkpoint", default=None,
+                        help=f"Path to a train.py checkpoint (.pt). Default: {DEFAULT_CHECKPOINT}")
     parser.add_argument("--output", default="predictions.json", help="Where to write the JSON output")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -58,13 +146,8 @@ def main():
     )
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    bundle, stack, predictor, _ = load_model(args.checkpoint, args.device)
 
-    # weights_only=False: the bundle intentionally carries the scaler arrays, the
-    # feature config and (for xgboost) the raw booster bytes, not just tensors.
-    bundle = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-
-    stack = FeatureStack.from_config(bundle["features_config"], device=device)
     dataset = CanonicalInferenceDataset(args.input_dir, bundle["canonical_size"])
     loader = DataLoader(
         dataset,
@@ -75,21 +158,7 @@ def main():
     )
 
     X, paths = extract_features(stack, loader)
-
-    columns = bundle.get("feature_columns")
-    if columns is not None:
-        if X.shape[1] <= max(columns):
-            raise RuntimeError(
-                f"The checkpoint expects a {max(columns) + 1}-dim feature vector but the "
-                f"rebuilt extractor stack produced {X.shape[1]}. The checkpoint's "
-                f"features_config and the installed extractors have diverged."
-            )
-        X = X[:, columns]
-
-    scaler = bundle["scaler"]
-    X = ((X - scaler["mean"]) / scaler["std"]).astype(np.float32)
-
-    probs = load_predictor(bundle)(X)
+    probs = predictor(apply_checkpoint_preprocessing(X, bundle))
 
     threshold = bundle["threshold"]
     if args.use_calibrated_threshold:
