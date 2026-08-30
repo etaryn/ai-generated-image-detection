@@ -73,6 +73,15 @@ MODELS = {
         "env_var": "AIGC_MODEL02_CHECKPOINT",
         "requirements": "server/model_02/requirements.txt",
     },
+    "model_03 — region-aware map → specialist routing → fusion": {
+        "key": "model_03",
+        "dir": _model_dir("model_03"),
+        # No weights of its own: it scores patches with a sibling detector, and
+        # which one is a config/env choice rather than a checkpoint path.
+        "checkpoint": "server/model_01/checkpoints/best.pt (via its patch-scorer backend)",
+        "env_var": "AIGC_MODEL03_BACKEND",
+        "requirements": "server/model_03/requirements.txt",
+    },
 }
 
 
@@ -112,7 +121,14 @@ def _load_backend(model_key, model_dir):
 
 
 def run_inference(image, model):
-    """Score `image` with the selected model. Returns P(AI-generated) in [0, 1].
+    """Score `image` with the selected model.
+
+    Returns `(score, report)`, where `score` is P(AI-generated) in [0, 1] and
+    `report` is a region-aware analysis when the backend produces one (model_03)
+    or None otherwise. A backend exposing `analyze_image` is called through it
+    rather than through `predict_image`, so the pipeline runs once and the UI
+    gets both the number and the map; calling both entry points would re-run the
+    whole analysis for the same upload.
 
     There is deliberately no mock fallback. An earlier version scored images with
     `((mean_pixel * 7) % 100) / 100` whenever the import failed, and swallowed the
@@ -120,7 +136,12 @@ def run_inference(image, model):
     never touched the model. A backend that is not wired up must look broken, not
     look like a working demo.
     """
-    return _load_backend(model["key"], model["dir"]).predict_image(image)
+    backend = _load_backend(model["key"], model["dir"])
+    analyze = getattr(backend, "analyze_image", None)
+    if analyze is not None:
+        report = analyze(image)
+        return float(report.score), report
+    return float(backend.predict_image(image)), None
 
 
 # --- SIDEBAR CONTROLS ---
@@ -167,7 +188,7 @@ if uploaded:
     
     # Run real-time inference on transformed image
     try:
-        score = run_inference(transformed_img, model)
+        score, report = run_inference(transformed_img, model)
     except Exception as exc:
         st.error(
             f"**{model['key']} is not available, so no score can be shown.**\n\n"
@@ -201,3 +222,45 @@ if uploaded:
         # 0.9995 to exactly 1.0, which hides the very movement this bench exists to
         # show. The unrounded score makes the difference visible.
         st.caption(f"raw P(AI-generated) = {score:.6g}")
+
+    # A region-aware backend (model_03) knows more than one number: where the
+    # evidence is, what kind it is, and how much of the frame it could not call.
+    # Showing only the score would throw away the part that distinguishes it.
+    if report is not None:
+        st.divider()
+        st.subheader("Where the evidence is")
+        st.write(f"**Verdict:** `{report.verdict.verdict}` · confidence {report.verdict.confidence:.2f}")
+        st.write(report.verdict.explanation)
+
+        backend = _load_backend(model["key"], model["dir"])
+        map_col, region_col = st.columns(2)
+        with map_col:
+            st.image(
+                backend.render_overlay(report),
+                caption="AI-likelihood map (grey = uncertain, warm = likely AI)",
+                width="stretch",
+            )
+        with region_col:
+            st.image(
+                backend.render_regions(report),
+                caption="Suspicious regions, with the specialist each was routed to",
+                width="stretch",
+            )
+
+        summary = report.amap.summary()
+        cols = st.columns(3)
+        cols[0].metric("Likely AI", f"{summary['frac_likely_ai'] * 100:.0f}%")
+        cols[1].metric("Uncertain", f"{summary['frac_uncertain'] * 100:.0f}%")
+        cols[2].metric("Likely not AI", f"{summary['frac_likely_non_ai'] * 100:.0f}%")
+
+        for finding in report.verdict.findings:
+            with st.expander(
+                f"Region #{finding.region.region_id} — {finding.label} "
+                f"({finding.probability:.2f}, via {finding.route.primary})"
+            ):
+                st.caption(f"Routed here because {finding.route.reason}.")
+                for line in finding.evidence:
+                    st.write(f"- {line}")
+
+        for note in report.notes:
+            st.info(note)

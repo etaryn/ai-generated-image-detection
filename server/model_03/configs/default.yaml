@@ -1,0 +1,86 @@
+# model_03 -- region-aware AI tamper forensics.
+#
+# Every value here is also a default in analyze.py's DEFAULTS dict, so the
+# pipeline runs with no config file at all; this file exists to make the knobs
+# visible and to be copied for experiments.
+
+backend:
+  # Which sibling detector scores the patches. model_01 is the cheap one whose
+  # weights are in the repo; model_02 is slower per patch but reads the noise
+  # floor directly, which is the evidence a *local* edit leaves.
+  name: model_01
+  checkpoint: null        # null -> the backend's own default / its env var
+  batch_size: 64
+
+mapper:
+  # Three scales, 50% overlap. Their disagreement is evidence, not noise: a
+  # small paste lights the fine scale and gets diluted at the coarse one.
+  #
+  # The 64px scale is what makes an edit's *extent* findable rather than just
+  # its centre. A region is only confidently mapped where windows fit inside it,
+  # so the finest scale sets the smallest edit the map can outline. Measured on
+  # tests/test_pipeline.py's 192px synthetic edit: [128, 224] localises it at
+  # IoU 0.17 (it finds the centre, not the shape), [64, 128, 224] at IoU 0.66,
+  # with no new false positives on the clean control.
+  #
+  # Cost scales as 1/scale^2: dropping to [128, 224] roughly quarters the patch
+  # count, which is the trade to make with the model_02 backend (two ViT passes
+  # per patch) or on very large uploads.
+  scales: [64, 128, 224]
+  overlap: 0.5
+
+  # How the per-scale maps combine. "max" because a coarse window that contains
+  # an edit plus authentic pixels reports their average by construction -- a low
+  # coarse reading is not counter-evidence, and averaging it in erases the
+  # signal the fine scale found. See mapper/blend.py's combine_scales.
+  scale_combine: max      # max | mean
+
+  # Three-way labelling. Between lo and hi is "uncertain", and stays uncertain.
+  threshold_hi: 0.75
+  threshold_lo: 0.45
+
+  # Bound the work: a 4000px upload at 128px/50% is ~4000 patches.
+  max_side: 1024
+
+  # Edge-preserving by default -- a blurred boundary is a boundary whose
+  # sharpness descriptor is meaningless, and routing reads that descriptor.
+  smoothing: guided       # guided | gaussian | box | none
+  smooth_radius: 8
+  smooth_eps: 0.001
+
+  # Pixels covered by few windows (the frame edge) are demoted to uncertain
+  # rather than trusted.
+  min_support: 0.15
+
+  # Path to a fitted calibrator (scripts/calibrate_mapper.py). While this is
+  # null the map is uncalibrated, its thresholds are nominal, and fusion caps
+  # the reported confidence at 0.60 and says so in the explanation.
+  calibration_path: null
+
+regions:
+  min_area_frac: 0.004    # below this a component is patch jitter, not an object
+  grow_into_uncertain: 3  # grow the confident core into the uncertain band, never into non-AI
+  close_radius: 2         # bridge threshold pinholes inside a region
+  halo_radius: 6          # the ring used for the uncertain-halo descriptor
+  max_regions: 8          # ranked by evidence mass (area x strength)
+
+routing:
+  run_alternates: true            # also run the alternate specialist on larger regions
+  alternate_min_area_frac: 0.02
+  face_detection: true            # silently inactive when OpenCV is absent
+
+  # Rule thresholds -- see router.py for what each rule means.
+  whole_image_frac: 0.55          # covers this much of the frame -> synthesis
+  scale_agreement_max: 0.12       # ...if the scales agree this closely
+  face_overlap_min: 0.35          # region/face overlap that takes the face route
+  sharp_boundary: 0.03            # map gradient per px at the rim
+  fine_scale_margin: 0.06         # fine-scale mean minus coarse-scale mean
+  rectangular_fill: 0.88          # area/bbox ratio that reads as a box selection
+  weak_score: 0.60                # below this -> fallback
+  min_support: 0.35               # thinner coverage than this -> fallback
+  min_area_frac: 0.008            # smaller than this -> fallback
+  unstable_scales: 0.22           # scales disagreeing more than this -> fallback
+
+fusion:
+  min_confidence: 0.35    # below this the verdict is "uncertain", whatever the score
+  decide_at: 0.5

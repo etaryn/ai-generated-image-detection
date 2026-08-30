@@ -1,0 +1,26 @@
+# model_03 = region-aware tamper forensics on top of a sibling detector.
+#
+# model_03 trains nothing and ships no weights of its own: it scores patches
+# with model_01 or model_02, so install that backend's requirements too. The
+# packages below are what model_03 itself needs on top.
+
+# The pipeline proper -- mapper, regions, routing, specialists, fusion, and the
+# overlay renderer -- needs only these two.
+numpy>=1.26
+Pillow>=10.0
+
+# Config files (configs/default.yaml). The pipeline runs without a config file,
+# so this is only needed if you pass --config.
+PyYAML>=6.0
+
+# Optional, both genuinely optional:
+scipy>=1.11             # fast connected components; there is a pure-numpy
+                        # fallback, ~20x slower on whole-image verdicts
+opencv-python-headless>=4.9  # face detection. Without it the face-edit route is
+                        # never taken and the report says so -- see
+                        # specialists/faces.py on why it under-claims rather
+                        # than guessing at faces
+
+# The patch-scorer backend (pick one, or both):
+#   pip install -r ../requirements.txt           # model_01: torch, torchvision
+#   pip install -r ../model_02/requirements.txt  # model_02: + transformers, xgboost
