@@ -54,6 +54,9 @@ DEFAULTS: dict = {
         "scales": [64, 128, 224],
         "overlap": 0.5,
         "scale_combine": "max",
+        # Measured and rejected -- see configs/default.yaml.
+        "cascade": False,
+        "cascade_gate": None,
         "threshold_hi": 0.75,
         "threshold_lo": 0.45,
         "max_side": 1024,

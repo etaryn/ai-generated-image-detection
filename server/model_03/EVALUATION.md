@@ -159,13 +159,23 @@ The knobs, roughly in order of value per unit of compute:
 | `--limit` on robustness | 15–20 | 100+ | linear × 14 conditions |
 | backend | `Organika/sdxl-detector` | compare 3–4 from `PUBLIC_MODELS` | linear per backend |
 
-**Do not expect a bigger GPU alone to help much.** Measured on the reference
-machine, the pipeline runs at **21% GPU utilisation** — it is bottlenecked on
-CPU-side patch cropping and `AutoImageProcessor` resizing (~1250 PIL crops per
-image), not on matrix multiplication. Raising `batch_size` and increasing
-dataloader parallelism will buy more than more FLOPs. The genuinely
-GPU-hungry item is not on this page: fine-tuning a patch-scale detector (see
-"The known ceiling").
+**A bigger GPU now helps — this changed.** The pipeline used to run at 21% GPU
+utilisation, bottlenecked on CPU-side patch cropping and `AutoImageProcessor`
+resizing (~1250 PIL crops per image). That work now happens on device as batched
+tensor ops (`HFImageClassifierBackend.score_crops`), which made patch scoring
+**3.05× faster** and moved utilisation to **96%**. The pipeline is now genuinely
+compute-bound on the model forward, so more FLOPs translate roughly linearly —
+which was not true before.
+
+Two things measured and *not* worth doing, recorded so they are not re-attempted:
+
+- **Bigger batches.** 64 is the optimum on an 8GB card; 128 and 256 were both
+  slower (3.75s → 4.36s → 4.69s for 1267 windows). Worth re-checking on a card
+  with more memory, but do not assume.
+- **TF32 / `channels_last`.** No measurable gain on an fp16 attention model.
+
+Still untried and plausible on a Linux server: `torch.compile` on the backbone,
+which typically pays for its compile time over a few hundred images.
 
 ---
 

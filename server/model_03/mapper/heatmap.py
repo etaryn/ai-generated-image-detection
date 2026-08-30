@@ -117,6 +117,8 @@ class AILikelihoodMapper:
         calibrator: Calibrator | None = None,
         scale_weights: dict[int, float] | None = None,
         scale_combine: str = "max",
+        cascade: bool = False,
+        cascade_gate: float | None = None,
     ):
         if not 0.0 <= threshold_lo <= threshold_hi <= 1.0:
             raise ValueError(
@@ -135,6 +137,8 @@ class AILikelihoodMapper:
         self.calibrator = calibrator or Calibrator.identity()
         self.scale_weights = scale_weights
         self.scale_combine = scale_combine
+        self.cascade = bool(cascade)
+        self.cascade_gate = cascade_gate
 
     def _to_working(self, image: Image.Image) -> Image.Image:
         rgb = image.convert("RGB")
@@ -177,7 +181,31 @@ class AILikelihoodMapper:
 
         per_scale: dict[int, np.ndarray] = {}
         supports: list[np.ndarray] = []
-        for scale, windows in plan.items():
+        skipped = 0
+        gate: np.ndarray | None = None
+
+        # Coarse scales first, so the finest can be gated on what they found.
+        # Ordering matters only when cascading; otherwise it is cosmetic.
+        ordered = sorted(plan.items(), key=lambda kv: -kv[0])
+
+        for scale, windows in ordered:
+            if self.cascade and gate is not None and scale == min(plan):
+                # The finest scale is ~3/4 of all windows at the default
+                # settings, and on an authentic photograph almost all of them
+                # are spent confirming that nothing is there. Skip the ones
+                # whose box does not touch any pixel the coarse scales found
+                # even weakly suspicious. Testing the whole box (rather than a
+                # dilated centre) is deliberately generous: a window survives if
+                # it overlaps the gate at all.
+                kept = [w for w in windows if gate[w.y0 : w.y1, w.x0 : w.x1].any()]
+                skipped = len(windows) - len(kept)
+                windows = kept
+                if not windows:
+                    # Nothing to add: this scale contributes no data, and
+                    # combine_scales treats the absent map as "uncovered" rather
+                    # than as evidence of anything.
+                    continue
+
             scores = self._score_windows(work, windows)
             # Calibration is per patch, not per pixel: the fit was measured on
             # patch scores, so it has to be applied before the blend averages
@@ -192,6 +220,14 @@ class AILikelihoodMapper:
             heat, support = blend_scale(height, width, windows, scores)
             per_scale[scale] = heat
             supports.append(support)
+
+            if self.cascade and gate is None and len(plan) > 1 and scale != min(plan):
+                # Build (or widen) the gate from every coarse scale seen so far.
+                coarse = combine_scales(per_scale, self.scale_weights, self.scale_combine)
+                threshold = self.cascade_gate if self.cascade_gate is not None else self.threshold_lo
+                candidate = np.nan_to_num(coarse, nan=1.0) >= threshold
+                if scale == sorted(plan)[1]:  # the last coarse scale
+                    gate = candidate
 
         combined = combine_scales(per_scale, self.scale_weights, self.scale_combine)
         support = np.mean(np.stack(supports), axis=0).astype(np.float32)
@@ -215,7 +251,9 @@ class AILikelihoodMapper:
             calibrated=bool(self.calibrator.fitted),
             meta={
                 "backend": getattr(self.scorer, "name", "unknown"),
-                "windows_scored": count_windows(plan),
+                "windows_scored": count_windows(plan) - skipped,
+                "windows_planned": count_windows(plan),
+                "windows_skipped_by_cascade": skipped,
                 "overlap": self.overlap,
                 "smoothing": self.smoothing,
             },
