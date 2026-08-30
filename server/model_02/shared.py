@@ -21,6 +21,8 @@ Re-exported here:
 """
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
@@ -28,27 +30,80 @@ from types import ModuleType
 
 MODEL_01_ROOT = Path(__file__).resolve().parent.parent / "model_01"
 
+# Alias -> file, relative to MODEL_01_ROOT.
+_ALIAS_FILES = {
+    "model_01.data.datasets": "data/datasets.py",
+    "model_01.data.transforms": "data/transforms.py",
+    "model_01.eval.metrics": "eval/metrics.py",
+}
+# Intermediate package names the aliases imply. They hold no code; they exist so
+# `import model_01.data.transforms` can walk the chain.
+_ALIAS_PACKAGES = ("model_01", "model_01.data", "model_01.eval")
+
+
+class _AliasPackageLoader(importlib.abc.Loader):
+    """Loader for the empty intermediate packages."""
+
+    def create_module(self, spec):  # noqa: D102 - default semantics
+        return None
+
+    def exec_module(self, module):  # noqa: D102 - nothing to execute
+        pass
+
+
+class ModelO1AliasFinder(importlib.abc.MetaPathFinder):
+    """Makes the private `model_01.*` aliases importable by name.
+
+    Stuffing the modules directly into sys.modules (what this file used to do) is
+    enough for the parent process, but pickle stores a class as module-name +
+    qualname and re-imports that module on the other side. Under Python 3.13 and
+    earlier that was invisible: DataLoader workers were forked, so they inherited
+    the parent's sys.modules. Python 3.14 switched the POSIX default start method
+    to forkserver, whose workers start clean and re-import -- at which point
+    `model_01.data.transforms` does not exist and unpickling RobustnessAugment
+    fails with "No module named 'model_01'".
+
+    Registering a finder fixes it at the source, so the aliases resolve in any
+    fresh interpreter. The alternative, forcing multiprocessing back to 'fork', is
+    worse here: forking a process that has already initialised CUDA is a known
+    deadlock, and this code is meant to run on GPU nodes.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in _ALIAS_PACKAGES:
+            spec = importlib.machinery.ModuleSpec(
+                fullname, _AliasPackageLoader(), is_package=True
+            )
+            spec.submodule_search_locations = []
+            return spec
+        relpath = _ALIAS_FILES.get(fullname)
+        if relpath is None:
+            return None
+        target_path = MODEL_01_ROOT / relpath
+        if not target_path.exists():
+            raise ImportError(
+                f"model_02 shares data/augmentation/metric code with model_01, but "
+                f"{target_path} does not exist. Expected layout: server/model_01/ "
+                f"and server/model_02/ side by side."
+            )
+        return importlib.util.spec_from_file_location(fullname, target_path)
+
+
+def _install_finder() -> None:
+    if not any(isinstance(f, ModelO1AliasFinder) for f in sys.meta_path):
+        sys.meta_path.insert(0, ModelO1AliasFinder())
+
+
+_install_finder()
+
 
 def load_model_01_module(relpath: str, alias: str) -> ModuleType:
-    """Import `model_01/<relpath>` under the private name `alias`.
-
-    Raises a pointed error if model_01 isn't next to model_02 -- that's a layout
-    problem the user needs to fix, not something to paper over with a fallback.
-    """
-    path = MODEL_01_ROOT / relpath
-    if not path.exists():
-        raise ImportError(
-            f"model_02 shares data/augmentation/metric code with model_01, but "
-            f"{path} does not exist. Expected layout: server/model_01/ and "
-            f"server/model_02/ side by side."
-        )
-    if alias in sys.modules:
-        return sys.modules[alias]
-    spec = importlib.util.spec_from_file_location(alias, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[alias] = module
-    spec.loader.exec_module(module)
-    return module
+    """Import `model_01/<relpath>` under the private name `alias`."""
+    if alias in _ALIAS_FILES and _ALIAS_FILES[alias] != relpath:
+        raise ValueError(f"alias {alias!r} is already mapped to {_ALIAS_FILES[alias]!r}")
+    _ALIAS_FILES.setdefault(alias, relpath)
+    _install_finder()
+    return importlib.import_module(alias)
 
 
 _datasets = load_model_01_module("data/datasets.py", "model_01.data.datasets")
@@ -69,6 +124,7 @@ threshold_for_target_fpr = _metrics.threshold_for_target_fpr
 
 __all__ = [
     "MODEL_01_ROOT",
+    "ModelO1AliasFinder",
     "load_model_01_module",
     "RealFakeImageDataset",
     "ImageFolderInference",
