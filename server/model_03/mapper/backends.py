@@ -563,6 +563,12 @@ def build_backend(spec: str | None = None, **kwargs) -> PatchScorer:
     if spec.startswith("hf:"):
         kwargs.setdefault("model_id", spec[len("hf:") :])
         spec = "hf"
+    elif spec not in BACKENDS and Path(spec).is_dir():
+        # A locally trained checkpoint directory (scripts/train_patch_scorer.py).
+        # Checked before the "/" heuristic because a Windows path has no forward
+        # slashes and would otherwise be rejected as an unknown backend.
+        kwargs.setdefault("model_id", str(Path(spec)))
+        spec = "hf"
     elif spec not in BACKENDS and "/" in spec:
         kwargs.setdefault("model_id", spec)
         spec = "hf"

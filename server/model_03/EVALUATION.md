@@ -254,6 +254,59 @@ edit size instead of reporting one average.
 
 ---
 
+## Training a patch scorer (the server job)
+
+This is the one intervention the evidence supports, and it is the reason
+`scripts/train_patch_scorer.py` exists. Run it where the GPUs are.
+
+**Nothing here ships the dataset.** SID-Set is ~123GB of train shards, it is
+someone else's data (CC-BY-4.0, built on OpenImages/COCO/Flickr30k), and the
+fetch is deterministic — reading fixed row groups in order — so the same command
+reproduces byte-identical images anywhere. Fetch it on the machine that needs
+it rather than pushing it through git.
+
+```bash
+cd server/model_03
+pip install -r requirements.txt
+
+# 1. training images (~1.9GB, ~20 min). Exactly the sample used locally:
+python eval/fetch_sid_set.py --split train --shard 0 --shards 6 \
+    --per_class 100 --out eval_data/sid_set_train
+
+#    scale up on a server -- 40 shards is ~12k images:
+#    python eval/fetch_sid_set.py --split train --shard 0 --shards 40 \
+#        --per_class 250 --out eval_data/sid_set_train
+
+# 2. fine-tune. Raise batch_size to fill a bigger card.
+python scripts/train_patch_scorer.py \
+    --data eval_data/sid_set_train --out checkpoints/patch_scorer \
+    --epochs 3 --per_image 4 --batch_size 32
+
+# 3. score it on the split it never saw
+python eval/fetch_sid_set.py --split validation --shard 0 --per_class 120 \
+    --out eval_data/sid_set_val
+python eval/evaluate.py --backend checkpoints/patch_scorer \
+    --out eval_results/patch_scorer.json
+python eval/ablation.py eval_results/patch_scorer.json
+```
+
+`--backend` accepts a local directory, so a trained checkpoint drops in with no
+other change.
+
+**Judge it on per-pixel map AUC, not patch accuracy.** The script prints both and
+refuses to endorse the model as a localiser if the map stays near chance. A
+model can rank patches well globally and still produce a useless map, because
+what the mapper needs is that patches *inside* an edit outrank patches *outside*
+it **within the same image**. Patch accuracy is exactly the metric that would let
+us declare success without having earned it. The base model's numbers to beat:
+
+| Metric | base model |
+|---|---|
+| Per-pixel map AUC vs masks | **0.460** (below chance) |
+| Patch AUC on mask-labelled patches | **0.335** (below chance) |
+| Localisation mean IoU | 0.074 |
+| Tampered detection AUC | 0.589 |
+
 ## The known ceiling
 
 Every backend available is trained on **whole images**, and model_03 asks it
