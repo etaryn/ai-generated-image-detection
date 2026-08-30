@@ -16,12 +16,12 @@ should exist that you cannot regenerate.
 
 ## The objective, and what counts as success
 
-**There are two classes, real and AI. Each has an untampered and a tampered
-subset, where "tampered" means the image was degraded — resized, blurred,
+**There are two classes, real and AI. Each has an unprocessed and a processed
+subset, where "processed" means the image was degraded — resized, blurred,
 cropped, recompressed. The system makes one call, real vs AI, and it has to hold
 up across that degradation.**
 
-|  | untampered | tampered (degraded) |
+|  | unprocessed | processed (degraded) |
 |---|---|---|
 | **real** | real, clean | real, degraded |
 | **AI** | AI, clean | AI, degraded |
