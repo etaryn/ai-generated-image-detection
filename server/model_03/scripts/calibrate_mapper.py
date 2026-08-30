@@ -82,6 +82,61 @@ def sample_patches(
     return out
 
 
+def collect_from_manifest(
+    manifest_path: Path,
+    scales: list[int],
+    per_image: int,
+    max_images: int,
+    seed: int,
+):
+    """Collect patches from a SID-Set style manifest (eval/fetch_sid_set.py).
+
+    This is the layout worth calibrating on, because it carries all three cases
+    and labels each patch correctly:
+
+        real        every patch authentic
+        synthetic   every patch generated
+        tampered    per-patch, by whether the patch centre falls inside the mask
+
+    That last line is the whole point. Calibrating on a two-class whole-image
+    dataset teaches the map that every patch of an edited photograph is
+    generated, which is false for most of them and biases the thresholds that
+    the entire routing stage depends on.
+    """
+    rng = random.Random(seed)
+    manifest = json.loads(manifest_path.read_text())
+    root = manifest_path.parent
+
+    items = list(manifest["items"])
+    rng.shuffle(items)
+
+    patches, labels = [], []
+    per_class_count: dict[str, int] = {}
+    for row in items:
+        cls = row["class"]
+        if per_class_count.get(cls, 0) >= max_images:
+            continue
+
+        with Image.open(root / row["image"]) as handle:
+            image = handle.convert("RGB")
+
+        mask = None
+        image_label = 0
+        if cls == "synthetic":
+            image_label = 1
+        elif cls == "tampered" and row.get("mask"):
+            with Image.open(root / row["mask"]) as handle:
+                mask = np.asarray(handle.convert("L").resize(image.size)) > 127
+
+        for patch, label in sample_patches(image, scales, per_image, rng, mask, image_label):
+            patches.append(patch)
+            labels.append(label)
+        per_class_count[cls] = per_class_count.get(cls, 0) + 1
+
+    print(f"sampled from {per_class_count} images per class")
+    return patches, np.array(labels, dtype=np.float64)
+
+
 def collect(
     data_dir: Path,
     mask_dir: Path | None,
@@ -120,7 +175,15 @@ def collect(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data_dir", required=True, help="Folder with real/ and fake/ subdirectories")
+    parser.add_argument("--data_dir", default=None, help="Folder with real/ and fake/ subdirectories")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="A SID-Set style manifest.json from eval/fetch_sid_set.py. Preferred over "
+             "--data_dir: it carries real, fully-synthetic and tampered images, and the "
+             "tampered ones come with masks, which is the only honest way to calibrate "
+             "the locally-edited case.",
+    )
     parser.add_argument("--mask_dir", default=None,
                         help="Optional tamper masks (<image_stem>.png, white = tampered). "
                              "With masks, patches are labelled by their centre pixel, which is "
@@ -144,14 +207,22 @@ def main():
     parser.add_argument("--out", default="configs/calibration.json")
     args = parser.parse_args()
 
-    patches, labels = collect(
-        Path(args.data_dir),
-        Path(args.mask_dir) if args.mask_dir else None,
-        args.scales,
-        args.per_image,
-        args.max_images,
-        args.seed,
-    )
+    if not args.manifest and not args.data_dir:
+        raise SystemExit("Pass --manifest (preferred) or --data_dir.")
+
+    if args.manifest:
+        patches, labels = collect_from_manifest(
+            Path(args.manifest), args.scales, args.per_image, args.max_images, args.seed
+        )
+    else:
+        patches, labels = collect(
+            Path(args.data_dir),
+            Path(args.mask_dir) if args.mask_dir else None,
+            args.scales,
+            args.per_image,
+            args.max_images,
+            args.seed,
+        )
     if len(patches) < 64:
         raise SystemExit(f"Only {len(patches)} patches collected; need at least 64 to fit anything.")
     print(f"collected {len(patches)} patches ({int(labels.sum())} positive)")
@@ -188,7 +259,12 @@ def main():
             "method": args.method,
             "ece_before": before,
             "ece_after": after,
-            "labelled_by": "tamper_mask" if args.mask_dir else "whole_image_label",
+            "labelled_by": (
+                "tamper_mask_manifest" if args.manifest
+                else "tamper_mask" if args.mask_dir
+                else "whole_image_label"
+            ),
+            "source": args.manifest or args.data_dir,
         }
     )
 
