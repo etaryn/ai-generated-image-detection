@@ -14,6 +14,49 @@ should exist that you cannot regenerate.
 
 ---
 
+## The primary experiment: does the idea work?
+
+Everything else here characterises the pipeline. This one tests the thesis, in
+three steps:
+
+1. **With localisation** — the full pipeline: multi-scale map → regions →
+   specialist routing → fusion.
+2. **Without localisation** — the same backend, on the same image, scored once
+   as a whole. This is exactly what model_01 and model_02 do, and what every
+   whole-image detector does.
+3. **Compare** — and conclude.
+
+The two arms are **paired**: `eval/evaluate.py` records both numbers for every
+image in the same run, through the same backend, with the same preprocessing. So
+the difference isolates the region machinery and nothing else — not a different
+model, not a different sample. `eval/ablation.py` then does the comparison:
+
+```bash
+python eval/ablation.py eval_results/sid_set_calibrated.json --out EVALUATION_RESULTS.md
+```
+
+It reports three things that must not be conflated:
+
+| | What it answers | Baseline comparable? |
+|---|---|---|
+| **Detection AUC**, with a paired bootstrap CI on the difference | Does localisation make the image-level verdict *better*? | Yes — head to head |
+| **False positives at matched recall** | Was any gain bought by flagging everything? | Yes — both thresholded to flag the same share of AI images |
+| **Localisation IoU, and `ai_edited` vs `ai_generated`** | Where is the edit, and what kind is it? | **No** — a single score cannot do either at any threshold |
+
+The third row is the honest awkwardness of this evaluation: those are the
+capabilities the system exists for, and they have no baseline to beat, so they
+are reported separately rather than folded into a win/loss.
+
+The detection comparison is reported separately for **tampered** and
+**synthetic** images, because the thesis makes different predictions for each: a
+small edit is diluted in a whole-image score (localisation should help), while a
+wholly generated image has nothing to localise (it should not).
+
+`eval/ablation.py` prints an explicit overall verdict, and it can return a
+negative one — "the idea does NOT yet work" — which `tests/test_ablation.py`
+verifies on constructed data. An ablation that can only conclude "it works" is
+not an ablation.
+
 ## The dataset
 
 [SID-Set](https://huggingface.co/datasets/saberzl/SID_Set) (Huang et al., *SIDA:
@@ -80,6 +123,12 @@ python eval/evaluate.py --data_dir eval_data/sid_set_val \
 python eval/evaluate.py --data_dir eval_data/sid_set_val \
     --config configs/uncalibrated.yaml \
     --out eval_results/sid_set_uncalibrated.json
+
+# 4b. THE PRIMARY EXPERIMENT: with vs without localisation, paired, on the
+#     same images. Prints an explicit verdict on whether the idea works.
+python eval/ablation.py eval_results/sid_set_calibrated.json \
+    eval_results/sid_set_uncalibrated.json \
+    --out EVALUATION_RESULTS.md --json_out eval_results/ablation.json
 
 # 5. transform x severity robustness matrix
 python eval/robustness.py --data_dir eval_data/sid_set_val --limit 20 \
