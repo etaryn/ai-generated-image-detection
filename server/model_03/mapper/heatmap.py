@@ -153,8 +153,19 @@ class AILikelihoodMapper:
             return self.calibrator.apply(scores)
 
     def _score_windows(self, image: Image.Image, windows: list[Window]) -> list[float]:
-        patches = [image.crop(w.box) for w in windows]
-        return self.scorer.score_patches(patches)
+        """Score every window, letting the backend crop on device if it can.
+
+        A backend exposing `score_crops` is handed the boxes instead of a list
+        of PIL crops, so it can upload the image once and do the cropping and
+        resizing as batched tensor work. Measured on a 1024x768 image, that was
+        the difference between spending half the wall clock in the image
+        processor and spending almost none of it there. Backends without the
+        method are unaffected.
+        """
+        score_crops = getattr(self.scorer, "score_crops", None)
+        if score_crops is not None:
+            return score_crops(image, [w.box for w in windows])
+        return self.scorer.score_patches([image.crop(w.box) for w in windows])
 
     def run(self, image: Image.Image) -> AILikelihoodMap:
         work = self._to_working(image)

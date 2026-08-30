@@ -233,6 +233,57 @@ PUBLIC_MODELS = {
 DEFAULT_HF_MODEL = "Organika/sdxl-detector"
 
 
+def _pil_bicubic_weights(in_size: int, out_size: int):
+    """PIL's exact bicubic resampling weights for one axis.
+
+    `torch.nn.functional.interpolate(mode="bicubic")` is *not* the same filter
+    as PIL's. Torch uses the Keys cubic convolution with a = -0.75; PIL uses
+    a = -0.5, and derives its kernel support from the scale factor. On
+    downsampling the difference is small, but upsampling a 64px crop to a 224px
+    model input it is not: measured on structured content, patch scores diverged
+    by up to 0.27, which is more than the width of the "likely AI" decision
+    band. Approximating here would have shifted the finest scale -- the one
+    carrying most of the localisation signal -- and nothing would have failed.
+
+    So this reproduces PIL's `precompute_coeffs` directly. Because every window
+    at a given scale is the same size, the weights depend only on
+    (in_size, out_size) and can be built once and reused as a matrix, making the
+    resize two batched matmuls.
+
+    Returns a dense (out_size, in_size) float64 array.
+    """
+    import numpy as np
+
+    scale = in_size / out_size
+    filterscale = max(1.0, scale)
+    support = 2.0 * filterscale  # bicubic support is 2.0
+
+    def cubic(x: float) -> float:
+        # PIL's bicubic filter, a = -0.5.
+        a = -0.5
+        x = abs(x)
+        if x < 1.0:
+            return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+        if x < 2.0:
+            return (((x - 5.0) * x + 8.0) * x - 4.0) * a
+        return 0.0
+
+    weights = np.zeros((out_size, in_size), dtype=np.float64)
+    inv = 1.0 / filterscale
+    for out_index in range(out_size):
+        center = (out_index + 0.5) * scale
+        xmin = max(int(center - support + 0.5), 0)
+        xmax = min(int(center + support + 0.5), in_size)
+        total = 0.0
+        for x in range(xmin, xmax):
+            w = cubic((x - center + 0.5) * inv)
+            weights[out_index, x] = w
+            total += w
+        if total != 0.0:
+            weights[out_index, xmin:xmax] /= total
+    return weights
+
+
 class HFImageClassifierBackend:
     """Any Hugging Face image-classification model as a patch scorer.
 
@@ -259,7 +310,7 @@ class HFImageClassifierBackend:
         model_id: str | None = None,
         positive_label: str | None = None,
         positive_index: int | None = None,
-        batch_size: int = 32,
+        batch_size: int = 64,
         device: str | None = None,
         fp16: bool | None = None,
         trust_remote_code: bool = False,
@@ -303,6 +354,9 @@ class HFImageClassifierBackend:
             self._model.config.id2label, positive_label, positive_index
         )
         self.id2label = dict(self._model.config.id2label)
+        # Resampling matrices, keyed by (source size, target size). One entry
+        # per window scale, built on first use.
+        self._resize_cache: dict[tuple[int, int], object] = {}
 
     def describe(self) -> dict:
         """What this backend is, for the report's provenance line."""
@@ -316,6 +370,12 @@ class HFImageClassifierBackend:
         }
 
     def score_patches(self, images: Sequence) -> list[float]:
+        """Score a list of PIL patches through the model's own processor.
+
+        The reference path: whatever the processor does is by definition
+        correct. `score_crops` is the fast equivalent, and is checked against
+        this one in tests/test_fast_preprocess.py.
+        """
         torch = self._torch
         out: list[float] = []
         with torch.no_grad():
@@ -328,12 +388,129 @@ class HFImageClassifierBackend:
                         k: (v.half() if v.dtype == torch.float32 else v)
                         for k, v in inputs.items()
                     }
-                logits = self._model(**inputs).logits.float()
-                probs = logits.softmax(dim=-1)
-                # Sum over every AI-side class, so a multi-class model ("real",
-                # "gan", "diffusion") still yields one P(AI).
-                ai = probs[:, self.positive_indices].sum(dim=-1)
-                out.extend(float(v) for v in ai.detach().cpu().tolist())
+                out.extend(self._forward(inputs["pixel_values"]))
+        return out
+
+    def _forward(self, pixel_values) -> list[float]:
+        logits = self._model(pixel_values=pixel_values).logits.float()
+        probs = logits.softmax(dim=-1)
+        # Sum over every AI-side class, so a multi-class model ("real", "gan",
+        # "diffusion") still yields one P(AI).
+        ai = probs[:, self.positive_indices].sum(dim=-1)
+        return [float(v) for v in ai.detach().cpu().tolist()]
+
+    def _preprocess_config(self) -> dict | None:
+        """Read the processor's settings, or None if it does something unusual.
+
+        Only the plain resize -> rescale -> normalize pipeline is reproduced on
+        the GPU. Anything else (centre crops, padding, per-image rescaling)
+        falls back to the processor rather than being approximated, because a
+        preprocessing mismatch does not fail loudly -- it just quietly shifts
+        every score.
+        """
+        p = self._processor
+        size = getattr(p, "size", None)
+        height = getattr(size, "height", None) or (size or {}).get("height")
+        width = getattr(size, "width", None) or (size or {}).get("width")
+        if not height or not width:
+            return None
+        if getattr(p, "do_center_crop", None) or getattr(p, "crop_size", None):
+            return None
+        if not getattr(p, "do_resize", True) or not getattr(p, "do_normalize", True):
+            return None
+        if int(getattr(p, "resample", 3)) != 3:  # 3 == PIL.Image.BICUBIC
+            return None
+        return {
+            "height": int(height),
+            "width": int(width),
+            "rescale": float(getattr(p, "rescale_factor", 1 / 255)),
+            "mean": tuple(getattr(p, "image_mean", (0.485, 0.456, 0.406))),
+            "std": tuple(getattr(p, "image_std", (0.229, 0.224, 0.225))),
+        }
+
+    def _resize_weights(self, in_size: int, out_size: int):
+        """Cached PIL-equivalent resampling matrix, on device."""
+        key = (int(in_size), int(out_size))
+        cached = self._resize_cache.get(key)
+        if cached is None:
+            import numpy as np
+
+            weights = _pil_bicubic_weights(int(in_size), int(out_size))
+            cached = self._torch.from_numpy(np.ascontiguousarray(weights)).to(
+                self.device, dtype=self._torch.float32
+            )
+            self._resize_cache[key] = cached
+        return cached
+
+    def score_crops(self, image, boxes: Sequence) -> list[float]:
+        """Score many crops of one image, cropping and resizing on the GPU.
+
+        Profiled on a 1024x768 image at three scales (932 windows), the
+        processor path spent 4.72s resizing patches one at a time in Python
+        against 4.58s of actual model forward -- half the wall clock doing work
+        a batched `interpolate` does in milliseconds. PIL cropping was 0.06s, so
+        the crops were never the problem; the resize was.
+
+        This uploads the image once, slices every window out of it on device,
+        and resizes each same-sized group as one batch. Windows of a given scale
+        are all the same size, so the grouping is exactly the scale structure
+        the mapper already has.
+
+        `antialias=True` matters: PIL's bicubic downsampling filters first, and
+        without it a 224px window downsampled to 224 (a no-op) and a 64px window
+        upsampled would diverge from the reference in different directions.
+
+        Falls back to `score_patches` whenever the processor does anything this
+        cannot reproduce faithfully.
+        """
+        torch = self._torch
+        cfg = self._preprocess_config()
+        if cfg is None:
+            return self.score_patches([image.crop(tuple(b)) for b in boxes])
+
+        import numpy as np
+        from collections import defaultdict
+
+        rgb = np.asarray(image.convert("RGB"))
+        with torch.no_grad():
+            # np.array (not asarray): torch refuses to share a read-only buffer.
+            frame = torch.from_numpy(np.array(rgb)).to(self.device).permute(2, 0, 1).float()
+
+            mean = torch.tensor(cfg["mean"], device=self.device).view(1, 3, 1, 1)
+            std = torch.tensor(cfg["std"], device=self.device).view(1, 3, 1, 1)
+
+            groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+            for i, box in enumerate(boxes):
+                x0, y0, x1, y1 = box
+                groups[(y1 - y0, x1 - x0)].append(i)
+
+            out = [0.0] * len(boxes)
+            for _, indices in groups.items():
+                for start in range(0, len(indices), self.batch_size):
+                    chunk = indices[start : start + self.batch_size]
+                    stack = torch.stack(
+                        [frame[:, boxes[i][1] : boxes[i][3], boxes[i][0] : boxes[i][2]] for i in chunk]
+                    )
+                    # Separable resize with PIL's own weights, as two batched
+                    # matmuls. Horizontal first, then vertical, with a clamp and
+                    # round in between -- that is not incidental: PIL writes an
+                    # 8-bit image between its two passes, and bicubic overshoots
+                    # on sharp transitions, so skipping the intermediate
+                    # quantisation diverges by up to 24 levels on high-frequency
+                    # content. With it, the two agree to within 2 levels of 255
+                    # on pure noise and 1 on real images.
+                    wx = self._resize_weights(stack.shape[3], cfg["width"])
+                    wy = self._resize_weights(stack.shape[2], cfg["height"])
+                    cols = torch.einsum("pj,ncij->ncip", wx, stack)
+                    cols = cols.clamp(0, 255).round()
+                    resized = torch.einsum("oi,ncip->ncop", wy, cols)
+
+                    pixels = resized.clamp(0, 255).round() * cfg["rescale"]
+                    pixels = (pixels - mean) / std
+                    if self.fp16:
+                        pixels = pixels.half()
+                    for index, score in zip(chunk, self._forward(pixels)):
+                        out[index] = score
         return out
 
 
