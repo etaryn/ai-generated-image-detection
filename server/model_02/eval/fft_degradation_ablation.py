@@ -115,6 +115,23 @@ def check_alignment(clean: dict, other: dict, label: str) -> None:
         )
 
 
+def check_group_universe(train: dict, clean: dict) -> None:
+    """A separate training cache need not be row-aligned, but it must cover the same
+    source images, or the group-based train/val split would not partition the same set.
+
+    Row counts legitimately differ (an --aug-copies 1 cache holds 2 rows per image),
+    so alignment is checked on the group ids rather than the rows.
+    """
+    if train["meta"]["features"]["blocks"] != clean["meta"]["features"]["blocks"]:
+        raise SystemExit("train cache has a different feature-block layout than the clean cache.")
+    t, c = np.unique(train["groups"]), np.unique(clean["groups"])
+    if not np.array_equal(t, c):
+        raise SystemExit(
+            f"train cache covers {len(t)} source images, clean cache {len(c)}, and the group ids "
+            "differ. Rebuild both with the same --limit and seed."
+        )
+
+
 def describe_condition(cache: dict) -> str:
     """Human-readable degradation label, read back out of the cache's own metadata."""
     meta = cache["meta"]
@@ -130,6 +147,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--clean-cache", required=True, help="Clean (undegraded) feature cache")
+    parser.add_argument(
+        "--train-cache",
+        default=None,
+        help="Cache to FIT on (default: --clean-cache). Point this at an --aug-copies>0 cache to "
+             "ask how much realistic mixture-augmentation recovers, rather than training clean-only. "
+             "It may hold several rows per source image; it is matched to the eval caches by GROUP "
+             "id, not by row, so it does not need to be row-aligned to them.",
+    )
     parser.add_argument(
         "--degraded",
         action="append",
@@ -178,36 +203,52 @@ def main():
         conditions.append((label, cache))
 
     # Split on source image, exactly as train.py does, so the held-out set here is
-    # the held-out set everywhere else. The clean cache defines it; every degraded
-    # cache is row-aligned to it (checked above).
-    train_idx, val_idx = group_split(clean["groups"], cfg["data"]["val_split"], seed)
+    # the held-out set everywhere else. The clean cache defines the eval rows; every
+    # degraded cache is row-aligned to it (checked above).
+    #
+    # group_split derives the val GROUPS from the sorted unique group ids and the
+    # seed, so running it on either cache selects the same held-out source images
+    # even when the training cache has more rows per image.
+    train_cache = clean
+    if args.train_cache and args.train_cache != args.clean_cache:
+        train_cache = load_cache(args.train_cache)
+        check_group_universe(train_cache, clean)
+
+    train_idx, _ = group_split(train_cache["groups"], cfg["data"]["val_split"], seed)
+    _, val_idx = group_split(clean["groups"], cfg["data"]["val_split"], seed)
+    y_train = train_cache["y"]
     y = clean["y"]
     y_val = y[val_idx]
 
     print(f"clean cache : {args.clean_cache}")
-    print(f"rows        : {len(y)} ({len(train_idx)} train / {len(val_idx)} val, split by source image)")
+    print(f"train cache : {args.train_cache or args.clean_cache}"
+          + (f"  (aug_copies={train_cache['meta'].get('aug_copies')})" if train_cache is not clean else ""))
+    print(f"rows        : fit on {len(train_idx)} rows / score {len(val_idx)} rows, split by source image")
     print(f"val balance : {int((y_val == 0).sum())} real / {int((y_val == 1).sum())} fake")
     print(f"classifier  : {classifier_type}")
     print("conditions  : " + ", ".join(f"{lab} [{describe_condition(c)}]" for lab, c in conditions))
     print("combos      : " + ", ".join("+".join(c) for c in combos))
 
+    trained_on_label = "clean" if train_cache is clean else "augmented"
+
     records = []
     for combo in combos:
         name = "+".join(combo)
-        print(f"\n{'=' * 72}\nblocks: {name}  (train on CLEAN, score every condition)\n{'=' * 72}")
+        print(f"\n{'=' * 72}\nblocks: {name}  (fit on {trained_on_label.upper()}, score every condition)\n{'=' * 72}")
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        X_clean, _, col_idx = select_blocks(clean["X"], block_spec, combo)
+        _, _, col_idx = select_blocks(clean["X"], block_spec, combo)
         feature_names = [all_names[i] for i in col_idx]
 
-        scaler = fit_scaler(X_clean[train_idx])
+        X_fit = train_cache["X"][:, col_idx]
+        scaler = fit_scaler(X_fit[train_idx])
         payload, _ = train_classifier(
             cfg,
             classifier_type,
-            apply_scaler(X_clean[train_idx], scaler),
-            y[train_idx],
-            apply_scaler(X_clean[val_idx], scaler),
+            apply_scaler(X_fit[train_idx], scaler),
+            y_train[train_idx],
+            apply_scaler(clean["X"][:, col_idx][val_idx], scaler),
             y_val,
             feature_names,
             seed,
@@ -225,7 +266,7 @@ def main():
                     "blocks": name,
                     "condition": label,
                     "degradation": describe_condition(cache),
-                    "trained_on": "clean",
+                    "trained_on": trained_on_label,
                     "balanced_accuracy": bacc,
                     "auc": metrics["auc"],
                     "accuracy": metrics["accuracy"],
@@ -246,12 +287,13 @@ def main():
                 torch.manual_seed(seed)
                 np.random.seed(seed)
                 X_cond = cache["X"][:, col_idx]
-                sc = fit_scaler(X_cond[train_idx])
+                cond_train_idx, _ = group_split(cache["groups"], cfg["data"]["val_split"], seed)
+                sc = fit_scaler(X_cond[cond_train_idx])
                 pay, _ = train_classifier(
                     cfg,
                     classifier_type,
-                    apply_scaler(X_cond[train_idx], sc),
-                    y[train_idx],
+                    apply_scaler(X_cond[cond_train_idx], sc),
+                    y[cond_train_idx],
                     apply_scaler(X_cond[val_idx], sc),
                     y_val,
                     feature_names,
@@ -281,7 +323,7 @@ def main():
     df.to_csv(csv_path, index=False)
 
     order = [label for label, _ in conditions]
-    clean_trained = df[df["trained_on"] == "clean"]
+    clean_trained = df[df["trained_on"] == trained_on_label]
 
     for metric in ("balanced_accuracy", "auc"):
         pivot = (
