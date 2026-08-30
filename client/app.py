@@ -76,9 +76,11 @@ MODELS = {
     "model_03 — region-aware map → specialist routing → fusion": {
         "key": "model_03",
         "dir": _model_dir("model_03"),
-        # No weights of its own: it scores patches with a sibling detector, and
-        # which one is a config/env choice rather than a checkpoint path.
-        "checkpoint": "server/model_01/checkpoints/best.pt (via its patch-scorer backend)",
+        # No weights of its own: it scores patches with an existing detector,
+        # by default a public one pulled from the Hugging Face Hub and cached
+        # there. So there is no checkpoint path to point at -- which model it
+        # uses is a config/env choice.
+        "checkpoint": "no local checkpoint; downloads Organika/sdxl-detector on first use",
         "env_var": "AIGC_MODEL03_BACKEND",
         "requirements": "server/model_03/requirements.txt",
     },

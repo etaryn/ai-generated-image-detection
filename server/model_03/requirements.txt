@@ -1,13 +1,18 @@
-# model_03 = region-aware tamper forensics on top of a sibling detector.
+# model_03 = region-aware tamper forensics on top of an existing detector.
 #
-# model_03 trains nothing and ships no weights of its own: it scores patches
-# with model_01 or model_02, so install that backend's requirements too. The
-# packages below are what model_03 itself needs on top.
+# model_03 trains nothing and ships no weights. By default it scores patches
+# with a public AI-image detector from the Hugging Face Hub, downloaded and
+# cached on first use (see PUBLIC_MODELS in mapper/backends.py).
 
 # The pipeline proper -- mapper, regions, routing, specialists, fusion, and the
 # overlay renderer -- needs only these two.
 numpy>=1.26
 Pillow>=10.0
+
+# The default patch-scorer backend: a public detector from the Hub.
+torch>=2.1
+transformers>=4.40
+huggingface_hub>=0.22
 
 # Config files (configs/default.yaml). The pipeline runs without a config file,
 # so this is only needed if you pass --config.
@@ -21,6 +26,7 @@ opencv-python-headless>=4.9  # face detection. Without it the face-edit route is
                         # specialists/faces.py on why it under-claims rather
                         # than guessing at faces
 
-# The patch-scorer backend (pick one, or both):
+# Only if you want to score patches with this repo's own detectors instead
+# (--backend model_01 / model_02), kept for comparison:
 #   pip install -r ../requirements.txt           # model_01: torch, torchvision
-#   pip install -r ../model_02/requirements.txt  # model_02: + transformers, xgboost
+#   pip install -r ../model_02/requirements.txt  # model_02: + xgboost

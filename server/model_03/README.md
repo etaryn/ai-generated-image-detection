@@ -34,9 +34,10 @@ Input image
 Output: tamper map, regional labels, image verdict, confidence, explanation
 ```
 
-model_03 **trains nothing and ships no weights.** It scores patches with
-model_01 or model_02 and builds everything else on top. That is what makes it a
-prototype of the *architecture* rather than a fourth detector.
+model_03 **trains nothing and ships no weights.** It scores patches with an
+existing detector — by default a public one from the Hugging Face Hub — and
+builds everything else on top. That is what makes it a prototype of the
+*architecture* rather than a fourth detector.
 
 ---
 
@@ -47,7 +48,7 @@ its outputs are worth.
 
 | Stage | What it is | Trained? |
 |---|---|---|
-| Patch scoring | model_01 or model_02, whole-image detectors asked about patches | **Yes** — but on whole images, not patches |
+| Patch scoring | a public Hub detector (or model_01/model_02), asked about patches | **Yes** — but on whole images, not patches |
 | Calibration | Platt / isotonic map fitted on patch scores | **Yes**, when you fit one (`scripts/calibrate_mapper.py`); identity otherwise |
 | Blending, smoothing, labelling | Hann-weighted accumulation, guided filter, two thresholds | No — deterministic |
 | Region proposal | Connected components + geometric descriptors | No |
@@ -71,12 +72,18 @@ confidence is hard-capped at 0.55.
 ## Quick start
 
 ```bash
-pip install -r server/model_03/requirements.txt   # numpy, Pillow (+ optional scipy, cv2)
-pip install -r server/requirements.txt            # the model_01 backend: torch, torchvision
+pip install -r server/model_03/requirements.txt   # numpy, Pillow, torch, transformers
 
 cd server/model_03
 python infer.py --input_dir /path/to/images --output predictions.json
 ```
+
+The default patch scorer is **`Organika/sdxl-detector`**, a public Swin-based
+AI-image detector, downloaded from the Hugging Face Hub on first use (~350MB)
+and cached by `huggingface_hub` thereafter. No checkpoint of this project's own
+is involved. Set `$HF_HOME` to move the cache; to run somewhere without network,
+pre-download it elsewhere and point `$HF_HOME` at that cache, or set
+`$HF_HUB_OFFLINE=1` once it is warm.
 
 `predictions.json` matches model_01 and model_02 exactly, so all three are
 drop-in comparable on the same harness:
@@ -120,13 +127,71 @@ likely-AI/uncertain/likely-non-AI split, and each region's evidence.
 ### Choosing the patch scorer
 
 ```bash
-python infer.py --input_dir imgs --backend model_02       # or: export AIGC_MODEL03_BACKEND=model_02
+python infer.py --input_dir imgs --backend haywoodsloan/ai-image-detector-deploy
+python infer.py --input_dir imgs --backend model_01     # this repo's own detector
+export AIGC_MODEL03_BACKEND=Ateeqq/ai-vs-human-image-detector   # or via the environment
 ```
 
-`model_01` is the default: its weights are in the repo and it is fast enough to
-score ~1200 patches in about a second. `model_02` reads the noise floor directly
-via its FFT block, which is the evidence a *local* edit actually leaves, but it
-runs two ViT passes per patch — with it, drop the 64px scale (see below).
+`--backend` accepts `hf`, `hf:<hub id>`, a bare Hub id, or `model_01`/`model_02`.
+Any Hugging Face image-classification model works; these are the ones surveyed
+(`PUBLIC_MODELS` in `mapper/backends.py`):
+
+| Model | Arch | Labels | Notes |
+|---|---|---|---|
+| `Organika/sdxl-detector` **(default)** | swin, 87M | `0: artificial, 1: human` | Fine-tuned on SDXL output, so it knows a more current generator family than its parent |
+| `umm-maybe/AI-image-detector` | swin, 87M | `0: artificial, 1: human` | Most-downloaded of the family and the oldest; trained on 2022-era generators |
+| `haywoodsloan/ai-image-detector-deploy` | swinv2, 87M | `0: artificial, 1: real` | A reasonable second opinion to disagree with the default |
+| `Ateeqq/ai-vs-human-image-detector` | siglip, 93M | `0: ai, 1: hum` | Different feature family, so its errors are less correlated with the Swins' |
+| `prithivMLmods/Deep-Fake-Detector-Model` | siglip, 93M | `0: Fake, 1: Real` | Face/deepfake-oriented; pair with the face route rather than using generally |
+| `dima806/ai_vs_real_image_detection` | vit, 86M | `0: REAL, 1: FAKE` | **Labels reversed** relative to the others |
+
+That last row is why `mapper/labels.py` exists and is separately tested. Five of
+these put the AI class at index 0 and one puts it at index 1; hard-coding an
+index would invert that model silently — every generated image reading as
+authentic, the heatmap highlighting exactly the untampered regions, and nothing
+anywhere looking broken. So the AI class is resolved **by label name**, and an
+unrecognised label is a hard error naming what it saw, never a fallback to index
+0. Override with `backend.positive_label` (or `positive_index`) if you bring a
+model whose vocabulary this repo doesn't know.
+
+Every report records which detector ran and which of its outputs was read as
+"AI", under `backend` — the numbers are meaningless without it.
+
+### Check a backend before you trust it
+
+Name resolution removes one failure mode and not the other: a model whose
+uploaded config lists its classes in the wrong order will resolve "correctly"
+and score backwards, and nothing in the config can reveal that. The only
+reliable test is empirical.
+
+```bash
+python scripts/check_backend.py --data_dir data/raw/cifake --backend hf
+```
+
+It scores images whose labels you already know and reports `CORRECT`,
+`INVERTED`, or `NON-DISCRIMINATIVE` with the means and AUC behind the call.
+Measured on this repo's CIFAKE samples, 60 per class — as a demonstration of the
+check, **not** a ranking, since CIFAKE is 32×32 and every one of these detectors
+expects 224px:
+
+| Backend | fake | real | AUC | Verdict |
+|---|---|---|---|---|
+| `Organika/sdxl-detector` | 0.342 | 0.131 | 0.696 | CORRECT |
+| `dima806/ai_vs_real_image_detection` | 0.991 | 0.025 | 1.000 | CORRECT |
+| `Ateeqq/ai-vs-human-image-detector` | 0.581 | 0.764 | 0.454 | NON-DISCRIMINATIVE |
+
+The reversed-label model comes out `CORRECT`, which is the label machinery
+working; a hard-coded index would have scored a tidy AUC of 0.000 there. Its
+perfect 1.000 deserves suspicion rather than admiration — a perfect score on a
+public benchmark usually means that benchmark was in the training set. And
+`Ateeqq` is not broken, it saturates: 32px upscaled thumbnails are nothing like
+its training data, and on real photographs it may be the better model. Run the
+check on data resembling what you will actually analyse.
+
+`model_01` and `model_02` remain available for comparison, but they are poor
+patch scorers: model_01's shipped weights are CIFAKE at 32×32, so every patch is
+downsampled to 32px before scoring, destroying the fine blending seams this
+pipeline exists to find.
 
 ---
 
@@ -217,9 +282,12 @@ patch scores are neither calibrated nor comparable across backends.
 
 ```bash
 python scripts/calibrate_mapper.py --data_dir data/raw/cifake \
-    --backend model_01 --out configs/calibration_model_01.json
+    --backend hf --out configs/calibration_sdxl_detector.json
 # then set mapper.calibration_path in your config
 ```
+
+A calibrator is only valid for the backend and scales it was fitted on — both
+are recorded in the file's metadata, so keep one file per backend.
 
 It reports held-out ECE before and after, and warns if the fit made calibration
 worse. Until you fit one, the pipeline runs with `Calibrator.identity()`, **caps
@@ -248,12 +316,19 @@ python tests/test_windows.py        # coverage, edge clamping, degenerate sizes
 python tests/test_blend.py          # correct averages, and no square artefacts
 python tests/test_regions.py        # connected components, morphology, scipy/numpy parity
 python tests/test_calibration.py    # monotonicity, ECE improvement, bad-fit refusal
+python tests/test_labels.py         # which output means "AI" -- incl. the reversed model
+python tests/test_backends.py       # backend spec parsing; settings are never dropped
 python tests/test_pipeline.py       # end to end + the two conservatism rules in fusion
 ```
 
-They are `pytest`-discoverable too (`pytest tests/`). All 41 pass in this
-project's dev environment (Python 3.13, numpy 2.5, Pillow 12), and the pipeline
-has additionally been run end to end against the real model_01 checkpoint.
+They are `pytest`-discoverable too (`pytest tests/`). All 62 pass in this
+project's dev environment (Python 3.13, numpy 2.5, Pillow 12), none of them
+needing network or a GPU. The pipeline has additionally been run end to end
+against the real `Organika/sdxl-detector` weights: on this repo's CIFAKE
+samples that detector separates fake (mean 0.56) from real (mean 0.01) even at
+32×32, and on the synthetic fixtures the pipeline returns `likely_authentic`
+(0.001) for the clean control, `ai_generated` (0.97) for the wholly synthetic
+image, and `ai_edited` (0.74) for the locally edited one.
 
 ---
 
@@ -261,13 +336,25 @@ has additionally been run end to end against the real model_01 checkpoint.
 
 Ordered by how much they should change your reading of an output.
 
-- **The patch scorer is the ceiling, and the shipped one is small.** model_01's
-  bundled checkpoint is trained on CIFAKE at **32×32**, so every 64/128/224px
-  patch is downsampled to 32px before scoring — lossy for exactly the fine
-  blending seams this pipeline hunts. The map is only as good as the answers it
-  stitches together. A patch-level training run is the single highest-value next
-  step; the mapper is written so that dropping one in means adding a backend to
-  `mapper/backends.py` and nothing else.
+- **The patch scorer is the ceiling, and every available one is trained on whole
+  images.** Asking a public detector about a 128px crop is off-distribution:
+  it answers "does this fragment look generated?" when it was trained on "does
+  this image look generated?". Scores drift, usually toward the middle, which is
+  what the calibration step measures and corrects. A patch-level training run
+  remains the single highest-value next step; the mapper is written so that
+  dropping one in means adding a backend to `mapper/backends.py` and changing
+  nothing else.
+- **Each public detector carries its own generator-family bias.** `umm-maybe` is
+  the 2022-era baseline and will miss modern diffusion output; the SDXL
+  fine-tune knows SDXL best. None of them is a general oracle. Running a second
+  backend from a different feature family (a SigLIP against the Swins) and
+  comparing maps is the cheapest available check on this.
+- **A backend's labels are trusted from its config, and a config can be wrong.**
+  Resolution is by name and refuses to guess, which catches unfamiliar
+  vocabulary and the reversed-label case — but a model uploaded with its two
+  classes genuinely transposed would resolve cleanly and score backwards.
+  `scripts/check_backend.py` is the defence, and it is worth running on your own
+  data rather than assumed; the pipeline does not run it for you.
 - **The finest scale sets the smallest findable edit.** A region is confidently
   mapped only where windows fit *inside* it. Measured on the 192px synthetic
   edit: scales `[64, 128, 224]` recover it at IoU 0.66, `[128, 224]` at IoU 0.17
@@ -292,9 +379,12 @@ Ordered by how much they should change your reading of an output.
   specialists read, so the expected failure is confidence collapsing to
   `uncertain` — which is the right failure, but it should be measured, not
   assumed.
-- **Runtime** is ~1.2s for a 1600×1200 upload with the model_01 backend (932
-  windows at 1024px working resolution), dominated by patch scoring. Without
-  scipy, region extraction adds ~2s on whole-image verdicts.
+- **Runtime** is ~4.6s for a 1600×1200 upload with the default public backend
+  (932 windows at 1024px working resolution, fp16 on a CUDA GPU), almost
+  entirely patch scoring — ~1.2s with the much smaller model_01 backend. Drop to
+  `scales: [128, 224]` or lower `max_side` to trade localisation for speed; both
+  roughly quarter the patch count. On CPU, expect an order of magnitude worse.
+  Without scipy, region extraction adds ~2s on whole-image verdicts.
 
 ---
 
@@ -305,7 +395,11 @@ Ordered by how much they should change your reading of an output.
 | Question | is this image AI? | is this image AI? | *where*, *what kind*, *how sure*? |
 | Trains | CNN+Transformer end to end | a small classifier on frozen features | nothing |
 | Output | one score | one score | map + regions + verdict + explanation |
-| Depends on | — | — | one of the other two |
+| Depends on | — | — | any image-level detector |
 
-model_03 is not a replacement for either. It is a layer that turns either of
-them into a localiser, and it inherits their strengths and their blind spots.
+model_03 is not a replacement for either. It is a layer that turns *any*
+image-level detector into a localiser — by default a public one, since a
+detector trained at 224px on modern generator output is a much better instrument
+for the job than a 32px CIFAKE checkpoint. It inherits whatever detector it
+wraps, strengths and blind spots alike, which is exactly why the backend is
+named in the config, recorded in every report, and swappable in one flag.

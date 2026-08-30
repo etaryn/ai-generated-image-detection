@@ -1,29 +1,42 @@
 """Patch scorers: the one learned component Layer 1 stands on.
 
-model_03 does not train a detector of its own. It borrows one of the sibling
-projects' image-level detectors and asks it the same question many times, once
-per patch, then stitches the answers back into a map. Everything downstream --
-regions, routing, fusion -- is built on whatever this returns, so the backend is
-deliberately the first thing the config names.
+model_03 trains no detector of its own. It takes an existing image-level
+detector, asks it the same question many times -- once per patch -- and stitches
+the answers into a map. Everything downstream (regions, routing, fusion) is
+built on whatever this returns, so the backend is deliberately the first thing
+the config names.
 
 The contract is one method:
 
     score_patches(images: list[PIL.Image]) -> list[float]     # P(AI) per patch
 
-Batched, because a single 1024x1024 image at two scales with 50% overlap is a
-few hundred patches; scoring them one at a time through the siblings'
-`predict_image` would make the demo unusable. `Model01Backend` therefore
-reimplements model_01's preprocessing rather than calling its single-image
-helper in a loop -- it is the same transform, read from the same checkpoint.
+Three implementations:
 
-A note on what a patch score means. Both siblings were trained on whole images,
-so scoring a 128px crop asks them something slightly off-distribution: "does
-this fragment look generated?" rather than "does this image look generated?".
-That is a real limitation of the MVP, not a detail -- it is why the map is
-calibrated (see calibration.py) against patch scores rather than trusted raw,
-and why fusion refuses to turn a patch-level signal into a whole-image verdict
-on its own. The honest fix is a patch-level training run; the mapper is written
-so that dropping one in means adding a backend here and nothing else.
+* `HFImageClassifierBackend` -- **the default.** Any public AI-image detector on
+  the Hugging Face Hub; see `PUBLIC_MODELS` for the surveyed shortlist. These
+  are trained at 224px on modern generator output, which is what a patch scorer
+  needs to be.
+* `Model01Backend` / `Model02Backend` -- this repo's own detectors, kept so the
+  three models stay comparable on one harness. model_01's shipped weights are
+  CIFAKE at **32x32**, so every patch is downsampled to 32px before scoring,
+  destroying the fine blending seams this pipeline exists to find. Useful as a
+  baseline; a poor instrument for localisation.
+
+Scoring is batched because a 1024px image at three scales with 50% overlap is
+about a thousand patches, and one-at-a-time scoring would make the demo
+unusable. `Model01Backend` therefore reimplements model_01's preprocessing
+rather than calling its single-image helper in a loop -- the same transform,
+read from the same checkpoint.
+
+A note on what a patch score means, which applies to *every* backend here. All
+of them were trained on whole images, so scoring a 128px crop asks a slightly
+off-distribution question: "does this fragment look generated?" rather than
+"does this image look generated?". That is a real limitation of the MVP, not a
+detail -- it is why the map is calibrated (see calibration.py) rather than
+trusted raw, and why fusion refuses to turn a patch-level signal into a
+whole-image verdict on its own. The honest fix is a patch-level training run;
+the mapper is written so that dropping one in means adding a backend here and
+changing nothing else.
 """
 from __future__ import annotations
 
@@ -170,18 +183,227 @@ class CallableBackend:
         return [float(s) for s in scores]
 
 
-BACKENDS = {"model_01": Model01Backend, "model_02": Model02Backend}
+#: Public AI-image detectors on the Hugging Face Hub that work as patch scorers.
+#: `labels` records what each model's config said when it was surveyed -- it is
+#: documentation, not a contract: resolution always reads the config that was
+#: actually downloaded (see mapper/labels.py). Note dima806's flipped ordering.
+PUBLIC_MODELS = {
+    "Organika/sdxl-detector": {
+        "arch": "swin (87M)",
+        "labels": {0: "artificial", 1: "human"},
+        "note": "The default. Fine-tuned from umm-maybe on SDXL output, so it "
+                "knows a more current generator family than its parent.",
+    },
+    "umm-maybe/AI-image-detector": {
+        "arch": "swin (87M)",
+        "labels": {0: "artificial", 1: "human"},
+        "note": "The most-downloaded of the family and the oldest; trained on "
+                "2022-era generators, so expect it to miss modern diffusion output.",
+    },
+    "haywoodsloan/ai-image-detector-deploy": {
+        "arch": "swinv2 (87M)",
+        "labels": {0: "artificial", 1: "real"},
+        "note": "SwinV2; a reasonable second opinion to disagree with the default.",
+    },
+    "Ateeqq/ai-vs-human-image-detector": {
+        "arch": "siglip (93M)",
+        "labels": {0: "ai", 1: "hum"},
+        "note": "SigLIP backbone -- a different feature family from the Swin models, "
+                "so its errors are less correlated with theirs. Saturates on very "
+                "small images (AUC 0.454 on 32px CIFAKE, both medians ~0.997); check "
+                "it on your own data with scripts/check_backend.py first.",
+    },
+    "prithivMLmods/Deep-Fake-Detector-Model": {
+        "arch": "siglip (93M)",
+        "labels": {0: "Fake", 1: "Real"},
+        "note": "Face/deepfake-oriented. Pair it with the face-edit route rather "
+                "than using it as a general detector.",
+    },
+    "dima806/ai_vs_real_image_detection": {
+        "arch": "vit (86M)",
+        "labels": {0: "REAL", 1: "FAKE"},
+        "note": "Labels are REVERSED relative to the others. Handled automatically "
+                "by name resolution; a hard-coded index would invert it silently. "
+                "Scores a perfect 1.000 AUC on CIFAKE, which most likely means "
+                "CIFAKE was in its training set -- treat that number as leakage, "
+                "not as evidence it generalises.",
+    },
+}
+
+DEFAULT_HF_MODEL = "Organika/sdxl-detector"
+
+
+class HFImageClassifierBackend:
+    """Any Hugging Face image-classification model as a patch scorer.
+
+    This is model_03's default backend, and the reason is scope: model_01 and
+    model_02 are this repo's own detectors, trained on CIFAKE at 32x32, so every
+    patch handed to them is downsampled to 32px before scoring -- destroying the
+    fine blending seams the whole pipeline is built to find. A public detector
+    trained at 224px on modern generator output is a far better instrument for
+    the same job, and swapping it in costs nothing but a config line, because
+    the mapper only ever needed `score_patches`.
+
+    What it does *not* fix: these models were also trained on whole images, so
+    scoring a crop is still slightly off-distribution (see this module's header),
+    and each carries its own generator-family bias. That is what the calibration
+    step and the `PUBLIC_MODELS` registry's second opinions are for.
+
+    Weights come from the Hub on first use and are cached by `huggingface_hub`
+    thereafter; set $HF_HOME to move that cache, or pre-download on a machine
+    with network access and run offline with $HF_HUB_OFFLINE=1.
+    """
+
+    def __init__(
+        self,
+        model_id: str | None = None,
+        positive_label: str | None = None,
+        positive_index: int | None = None,
+        batch_size: int = 32,
+        device: str | None = None,
+        fp16: bool | None = None,
+        trust_remote_code: bool = False,
+    ):
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForImageClassification
+
+        from mapper.labels import resolve_positive_indices
+
+        self._torch = torch
+        self.model_id = model_id or DEFAULT_HF_MODEL
+        self.name = f"hf:{self.model_id}"
+        self.batch_size = int(batch_size)
+
+        try:
+            self._processor = AutoImageProcessor.from_pretrained(
+                self.model_id, trust_remote_code=trust_remote_code
+            )
+            self._model = AutoModelForImageClassification.from_pretrained(
+                self.model_id, trust_remote_code=trust_remote_code
+            )
+        except OSError as exc:
+            raise OSError(
+                f"Could not load {self.model_id!r} from the Hugging Face Hub or the local "
+                f"cache ({exc}). With network access it downloads on first use; without, "
+                f"pre-download it elsewhere and point $HF_HOME at the cache, or set "
+                f"backend.name to model_01 to use this repo's own weights."
+            ) from exc
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # fp16 roughly doubles throughput on a GPU and is meaningless on CPU.
+        self.fp16 = (self.device.startswith("cuda")) if fp16 is None else bool(fp16)
+        self._model = self._model.to(self.device)
+        if self.fp16:
+            self._model = self._model.half()
+        self._model.eval()
+
+        # Which output means "AI-generated" -- by name, never by index. See
+        # mapper/labels.py for why this is the module's most dangerous question.
+        self.positive_indices, self.label_reason = resolve_positive_indices(
+            self._model.config.id2label, positive_label, positive_index
+        )
+        self.id2label = dict(self._model.config.id2label)
+
+    def describe(self) -> dict:
+        """What this backend is, for the report's provenance line."""
+        return {
+            "backend": self.name,
+            "device": self.device,
+            "fp16": self.fp16,
+            "id2label": {str(k): v for k, v in self.id2label.items()},
+            "positive_indices": list(self.positive_indices),
+            "positive_resolved_by": self.label_reason,
+        }
+
+    def score_patches(self, images: Sequence) -> list[float]:
+        torch = self._torch
+        out: list[float] = []
+        with torch.no_grad():
+            for start in range(0, len(images), self.batch_size):
+                chunk = [im.convert("RGB") for im in images[start : start + self.batch_size]]
+                inputs = self._processor(images=chunk, return_tensors="pt")
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                if self.fp16:
+                    inputs = {
+                        k: (v.half() if v.dtype == torch.float32 else v)
+                        for k, v in inputs.items()
+                    }
+                logits = self._model(**inputs).logits.float()
+                probs = logits.softmax(dim=-1)
+                # Sum over every AI-side class, so a multi-class model ("real",
+                # "gan", "diffusion") still yields one P(AI).
+                ai = probs[:, self.positive_indices].sum(dim=-1)
+                out.extend(float(v) for v in ai.detach().cpu().tolist())
+        return out
+
+
+class CallableBackend:
+    """Wrap any `fn(list[PIL]) -> list[float]` as a scorer.
+
+    Exists so the geometry, region and fusion stages can be tested against a
+    scorer with known behaviour, with no checkpoint and no torch. The tests use
+    it; so can a notebook holding a third-party detector.
+    """
+
+    def __init__(self, fn: Callable[[Sequence], Sequence[float]], name: str = "callable"):
+        self._fn = fn
+        self.name = name
+
+    def score_patches(self, images: Sequence) -> list[float]:
+        scores = list(self._fn(images))
+        if len(scores) != len(images):
+            raise ValueError(
+                f"scorer returned {len(scores)} scores for {len(images)} patches"
+            )
+        return [float(s) for s in scores]
+
+
+BACKENDS = {
+    "hf": HFImageClassifierBackend,
+    "model_01": Model01Backend,
+    "model_02": Model02Backend,
+}
 
 
 def build_backend(spec: str | None = None, **kwargs) -> PatchScorer:
-    """Build the scorer named by `spec` ('model_01' | 'model_02').
+    """Build a patch scorer.
 
-    Falls back to $AIGC_MODEL03_BACKEND, then to model_01 -- the cheap one, and
-    the one whose weights are in the repo.
+    `spec` accepts:
+        'hf'                        the default public detector
+        'hf:<hub model id>'         a specific public detector
+        '<owner>/<model>'           the same, spelled as a bare Hub id
+        'model_01' | 'model_02'     this repo's own detectors, kept for comparison
+
+    Falls back to $AIGC_MODEL03_BACKEND, then to 'hf'. Only keyword arguments the
+    chosen backend actually accepts are forwarded; a stray one raises rather than
+    being silently dropped, because a silently-ignored `positive_label` is
+    exactly the kind of mistake that inverts a map.
     """
-    spec = spec or os.environ.get("AIGC_MODEL03_BACKEND") or "model_01"
+    import inspect
+
+    spec = spec or os.environ.get("AIGC_MODEL03_BACKEND") or "hf"
+
+    if spec.startswith("hf:"):
+        kwargs.setdefault("model_id", spec[len("hf:") :])
+        spec = "hf"
+    elif spec not in BACKENDS and "/" in spec:
+        kwargs.setdefault("model_id", spec)
+        spec = "hf"
+
     if spec not in BACKENDS:
         raise ValueError(
-            f"unknown patch-scorer backend {spec!r}; expected one of {sorted(BACKENDS)}"
+            f"unknown patch-scorer backend {spec!r}. Expected one of {sorted(BACKENDS)}, "
+            f"'hf:<hub model id>', or a bare Hub id like 'Organika/sdxl-detector'."
         )
-    return BACKENDS[spec](**kwargs)
+
+    cls = BACKENDS[spec]
+    accepted = set(inspect.signature(cls.__init__).parameters) - {"self"}
+    supplied = {k: v for k, v in kwargs.items() if v is not None}
+    unknown = sorted(set(supplied) - accepted)
+    if unknown:
+        raise TypeError(
+            f"backend {spec!r} does not accept {unknown}; it takes {sorted(accepted)}. "
+            f"(Leaving a setting silently unapplied is how a detector ends up scoring "
+            f"with the wrong class or the wrong checkpoint.)"
+        )
+    return cls(**supplied)

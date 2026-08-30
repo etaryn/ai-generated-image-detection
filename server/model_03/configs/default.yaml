@@ -5,12 +5,35 @@
 # visible and to be copied for experiments.
 
 backend:
-  # Which sibling detector scores the patches. model_01 is the cheap one whose
-  # weights are in the repo; model_02 is slower per patch but reads the noise
-  # floor directly, which is the evidence a *local* edit leaves.
-  name: model_01
-  checkpoint: null        # null -> the backend's own default / its env var
-  batch_size: 64
+  # What scores the patches. "hf" is any public AI-image detector from the
+  # Hugging Face Hub, and is the default: those are trained at 224px on modern
+  # generator output, whereas this repo's own model_01 checkpoint is CIFAKE at
+  # 32x32 -- so it downsamples every patch to 32px and destroys the fine
+  # blending seams this pipeline exists to find.
+  #
+  #   name: hf | model_01 | model_02
+  #
+  # Alternatives worth trying as a second opinion (see PUBLIC_MODELS in
+  # mapper/backends.py for the surveyed shortlist and what each is good for):
+  #   haywoodsloan/ai-image-detector-deploy   swinv2, a different training run
+  #   Ateeqq/ai-vs-human-image-detector       siglip, a different feature family
+  #   dima806/ai_vs_real_image_detection      vit -- note its labels are REVERSED
+  #                                           relative to the others, which is
+  #                                           handled by name (mapper/labels.py)
+  name: hf
+  model_id: Organika/sdxl-detector
+  batch_size: 32
+  device: null            # null -> cuda when available
+  fp16: null              # null -> true on cuda (roughly doubles throughput)
+
+  # Which output means "AI-generated". Leave null: it is resolved from the
+  # model's own label names, and an unrecognised label is a hard error rather
+  # than a guess -- an inverted map would look plausible and be exactly wrong.
+  # Set one of these only for a model whose labels this repo does not know.
+  positive_label: null
+  positive_index: null
+
+  checkpoint: null        # model_01 / model_02 only
 
 mapper:
   # Three scales, 50% overlap. Their disagreement is evidence, not noise: a

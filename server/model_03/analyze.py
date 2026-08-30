@@ -40,7 +40,16 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "default.yam
 
 
 DEFAULTS: dict = {
-    "backend": {"name": "model_01", "checkpoint": None, "batch_size": 64},
+    "backend": {
+        "name": "hf",
+        "model_id": None,        # None -> mapper.backends.DEFAULT_HF_MODEL
+        "positive_label": None,  # only set when a model's labels are unrecognised
+        "positive_index": None,
+        "batch_size": 32,
+        "device": None,
+        "fp16": None,            # None -> True on CUDA, False on CPU
+        "checkpoint": None,      # model_01 / model_02 only
+    },
     "mapper": {
         "scales": [64, 128, 224],
         "overlap": 0.5,
@@ -111,6 +120,8 @@ class AnalysisReport:
     timings: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
+    backend: dict = field(default_factory=dict)
+
     @property
     def score(self) -> float:
         return self.verdict.score
@@ -122,6 +133,11 @@ class AnalysisReport:
             "score": self.verdict.score,
             "confidence": self.verdict.confidence,
             "explanation": self.verdict.explanation,
+            # Provenance: which detector scored the patches, and which of its
+            # outputs was read as "AI". Every number in this report descends
+            # from that choice, so a report that does not record it cannot be
+            # audited after the fact.
+            "backend": self.backend,
             "regions": [f.to_dict(sf) for f in self.verdict.findings],
             "map": self.amap.summary(),
             "details": self.verdict.details,
@@ -217,6 +233,14 @@ class RegionAwareAnalyzer:
                 "the score is the whole-image detector's."
             )
 
+        describe = getattr(self.scorer, "describe", None)
+        backend = describe() if describe else {"backend": getattr(self.scorer, "name", "unknown")}
+
         return AnalysisReport(
-            verdict=verdict, amap=amap, image=image, timings=timings, notes=notes
+            verdict=verdict,
+            amap=amap,
+            image=image,
+            timings=timings,
+            notes=notes,
+            backend=backend,
         )

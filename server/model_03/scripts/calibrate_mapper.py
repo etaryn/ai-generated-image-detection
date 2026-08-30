@@ -7,7 +7,7 @@ so their patch scores are neither calibrated nor comparable between backends.
 This script measures the correction.
 
     python scripts/calibrate_mapper.py --data_dir data/raw/cifake \
-        --backend model_01 --out configs/calibration_model_01.json
+        --backend hf --out configs/calibration_sdxl_detector.json
 
 `--data_dir` is a folder with `real/` and `fake/` subdirectories -- the same
 layout model_01's data pipeline produces. Patches are sampled at the mapper's
@@ -125,9 +125,17 @@ def main():
                         help="Optional tamper masks (<image_stem>.png, white = tampered). "
                              "With masks, patches are labelled by their centre pixel, which is "
                              "the only way to calibrate the locally-edited case honestly.")
-    parser.add_argument("--backend", default="model_01", choices=["model_01", "model_02"])
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--scales", type=int, nargs="+", default=[128, 224])
+    parser.add_argument(
+        "--backend",
+        default="hf",
+        help="Patch scorer to calibrate: 'hf', 'hf:<hub model id>', a bare Hub id, "
+             "or 'model_01' / 'model_02'. A calibrator is only valid for the backend "
+             "it was fitted on -- the fit is recorded in the file's metadata.",
+    )
+    parser.add_argument("--checkpoint", default=None, help="model_01 / model_02 only")
+    parser.add_argument("--scales", type=int, nargs="+", default=[64, 128, 224],
+                        help="Must match the mapper's scales -- the fit describes the "
+                             "patch distribution the mapper will actually produce")
     parser.add_argument("--per_image", type=int, default=6, help="Patches sampled per image")
     parser.add_argument("--max_images", type=int, default=400, help="Images per class")
     parser.add_argument("--method", default="platt", choices=["platt", "isotonic"])
@@ -148,7 +156,7 @@ def main():
         raise SystemExit(f"Only {len(patches)} patches collected; need at least 64 to fit anything.")
     print(f"collected {len(patches)} patches ({int(labels.sum())} positive)")
 
-    kwargs = {"batch_size": 64} if args.backend == "model_01" else {}
+    kwargs = {}
     if args.checkpoint:
         kwargs["checkpoint"] = args.checkpoint
     scorer = build_backend(args.backend, **kwargs)
