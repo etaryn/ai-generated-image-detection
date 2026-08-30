@@ -42,7 +42,13 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_io import CanonicalDataset, NamedSeverity, build_labeled_samples, collate_labeled
+from data_io import (
+    CanonicalDataset,
+    NamedSeverity,
+    RealDegFixedOp,
+    build_labeled_samples,
+    collate_labeled,
+)
 from features.pipeline import FeatureStack
 from shared import RobustnessAugment
 
@@ -142,6 +148,25 @@ def main():
         default=None,
         help="Apply one fixed SEVERITY_LEVELS transform to every image (for robustness caches)",
     )
+    parser.add_argument(
+        "--realdeg-op",
+        default=None,
+        help="Apply one RealDeg-Bench operator (jpeg|blur|resize|noise|brightness|contrast|"
+             "saturation) at --realdeg-strength to every image. Use this rather than --severity "
+             "to build a degradation *sweep*: one cache per strength, at the bench's own values.",
+    )
+    parser.add_argument(
+        "--realdeg-strength",
+        type=float,
+        default=None,
+        help="Strength for --realdeg-op, e.g. 0.3 for resize. Must be in that operator's "
+             "RealDeg-Bench set unless --realdeg-off-bench is passed.",
+    )
+    parser.add_argument(
+        "--realdeg-off-bench",
+        action="store_true",
+        help="Allow a --realdeg-strength outside the published RealDeg-Bench set.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Only extract the first N source images")
     parser.add_argument("--device", default=None, help="cuda | cpu (default: cuda when available)")
     args = parser.parse_args()
@@ -156,10 +181,17 @@ def main():
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     aug_copies = args.aug_copies if args.aug_copies is not None else cfg["features"]["train_aug_copies"]
-    if args.severity is not None and aug_copies:
+    if (args.realdeg_op is None) != (args.realdeg_strength is None):
+        raise SystemExit("--realdeg-op and --realdeg-strength must be passed together.")
+    if args.severity is not None and args.realdeg_op is not None:
         raise SystemExit(
-            "--severity applies one fixed transform to every row; combining it with random "
-            "augmented copies would make the cache's severity label meaningless. Pass --aug-copies 0."
+            "--severity and --realdeg-op both set the cache's single fixed transform; pass only one."
+        )
+    if (args.severity is not None or args.realdeg_op is not None) and aug_copies:
+        raise SystemExit(
+            "--severity/--realdeg-op apply one fixed transform to every row; combining them with "
+            "random augmented copies would make the cache's severity label meaningless. "
+            "Pass --aug-copies 0."
         )
 
     if args.demo_eval_set:
@@ -176,7 +208,17 @@ def main():
     rows, groups, aug_flags = build_rows(samples, aug_copies, seed)
     canonical_size = cfg["data"]["canonical_size"]
 
-    if args.severity is not None:
+    realdeg_transform = None
+    if args.realdeg_op is not None:
+        realdeg_transform = RealDegFixedOp(
+            args.realdeg_op, args.realdeg_strength, seed=seed, strict=not args.realdeg_off_bench
+        )
+
+    if realdeg_transform is not None:
+        dataset = CanonicalDataset(
+            rows, canonical_size, pil_transform=realdeg_transform, group_ids=groups
+        )
+    elif args.severity is not None:
         dataset = CanonicalDataset(
             rows, canonical_size, pil_transform=NamedSeverity(args.severity), group_ids=groups
         )
@@ -210,6 +252,11 @@ def main():
         "config": {"data": cfg["data"], "features": cfg["features"]},
         "aug_copies": aug_copies,
         "severity": args.severity,
+        "realdeg": (
+            {"op": args.realdeg_op, "strength": args.realdeg_strength,
+             "label": realdeg_transform.label(), "seed": seed}
+            if realdeg_transform is not None else None
+        ),
         "n_source_images": len(samples),
         "demo_eval_set": bool(args.demo_eval_set),
     }

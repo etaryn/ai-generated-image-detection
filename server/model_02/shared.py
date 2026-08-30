@@ -18,6 +18,9 @@ Re-exported here:
     apply_named_transform                        (data/transforms.py)
     compute_all_metrics, fpr_at_threshold,
     threshold_for_target_fpr                     (eval/metrics.py)
+    RealDegSampler, RealDegStep, apply_realdeg_chain,
+    REALDEG_OPERATORS, REALDEG_STRENGTHS,
+    balanced_accuracy                            (eval/realdeg.py)
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ _ALIAS_FILES = {
     "model_01.data.datasets": "data/datasets.py",
     "model_01.data.transforms": "data/transforms.py",
     "model_01.eval.metrics": "eval/metrics.py",
+    "model_01.eval.realdeg": "eval/realdeg.py",
 }
 # Intermediate package names the aliases imply. They hold no code; they exist so
 # `import model_01.data.transforms` can walk the chain.
@@ -109,6 +113,7 @@ def load_model_01_module(relpath: str, alias: str) -> ModuleType:
 _datasets = load_model_01_module("data/datasets.py", "model_01.data.datasets")
 _transforms = load_model_01_module("data/transforms.py", "model_01.data.transforms")
 _metrics = load_model_01_module("eval/metrics.py", "model_01.eval.metrics")
+_realdeg = load_model_01_module("eval/realdeg.py", "model_01.eval.realdeg")
 
 RealFakeImageDataset = _datasets.RealFakeImageDataset
 ImageFolderInference = _datasets.ImageFolderInference
@@ -117,6 +122,13 @@ IMAGE_EXTENSIONS = _datasets.IMAGE_EXTENSIONS
 RobustnessAugment = _transforms.RobustnessAugment
 SEVERITY_LEVELS = _transforms.SEVERITY_LEVELS
 apply_named_transform = _transforms.apply_named_transform
+
+RealDegSampler = _realdeg.RealDegSampler
+RealDegStep = _realdeg.Step
+REALDEG_OPERATORS = _realdeg.OPERATORS
+REALDEG_STRENGTHS = _realdeg.STRENGTHS
+apply_realdeg_chain = _realdeg.apply_chain
+balanced_accuracy = _realdeg.balanced_accuracy
 
 compute_all_metrics = _metrics.compute_all_metrics
 fpr_at_threshold = _metrics.fpr_at_threshold
@@ -132,6 +144,12 @@ __all__ = [
     "RobustnessAugment",
     "SEVERITY_LEVELS",
     "apply_named_transform",
+    "RealDegSampler",
+    "RealDegStep",
+    "REALDEG_OPERATORS",
+    "REALDEG_STRENGTHS",
+    "apply_realdeg_chain",
+    "balanced_accuracy",
     "compute_all_metrics",
     "fpr_at_threshold",
     "threshold_for_target_fpr",

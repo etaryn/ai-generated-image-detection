@@ -28,7 +28,14 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
-from shared import IMAGE_EXTENSIONS, RealFakeImageDataset, apply_named_transform
+from shared import (
+    IMAGE_EXTENSIONS,
+    REALDEG_STRENGTHS,
+    RealFakeImageDataset,
+    RealDegStep,
+    apply_named_transform,
+    apply_realdeg_chain,
+)
 
 
 def canonical_transform(canonical_size: int):
@@ -44,6 +51,44 @@ class NamedSeverity:
 
     def __call__(self, img: Image.Image) -> Image.Image:
         return apply_named_transform(img, self.severity_name)
+
+
+class RealDegFixedOp:
+    """Callable applying ONE RealDeg operator at ONE fixed strength to every image.
+
+    `NamedSeverity` can't express this: SEVERITY_LEVELS hardcodes its own magnitudes
+    (resize 0.5x / 0.25x), while RealDeg-Bench sweeps a different, finer set --
+    resize {0.9, 0.7, 0.5, 0.3, 0.2}. A degradation *sweep* needs one cache per
+    strength, with the strength recorded, so the eval can plot a decay curve rather
+    than compare two isolated points.
+
+    Strength is validated against the bench's set for that operator, because a
+    typo here produces a plausible-looking cache at a strength no table reports.
+
+    Only op/strength/seed are stored (plain str/float/int), so DataLoader workers
+    under forkserver can unpickle this without needing the `model_01.eval.realdeg`
+    alias resolved at unpickle time.
+    """
+
+    def __init__(self, op: str, strength: float, seed: int = 0, strict: bool = True):
+        if op not in REALDEG_STRENGTHS:
+            raise KeyError(
+                f"unknown RealDeg operator {op!r}; expected one of {sorted(REALDEG_STRENGTHS)}"
+            )
+        if strict and not any(abs(strength - s) < 1e-9 for s in REALDEG_STRENGTHS[op]):
+            raise ValueError(
+                f"strength {strength} is not in the RealDeg-Bench set for {op!r}: "
+                f"{REALDEG_STRENGTHS[op]}. Pass strict=False to sweep off-bench values."
+            )
+        self.op = op
+        self.strength = float(strength)
+        self.seed = int(seed)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return apply_realdeg_chain(img, [RealDegStep(self.op, self.strength)], seed=self.seed)
+
+    def label(self) -> str:
+        return f"{self.op}_{self.strength:g}"
 
 
 def build_labeled_samples(dataset_roots: Sequence[str | Path]) -> list[tuple[Path, int]]:
