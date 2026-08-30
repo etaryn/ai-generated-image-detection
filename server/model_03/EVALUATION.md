@@ -14,6 +14,43 @@ should exist that you cannot regenerate.
 
 ---
 
+## The objective, and what counts as success
+
+**There are two classes, real and AI. Each has an untampered and a tampered
+subset, where "tampered" means the image was degraded — resized, blurred,
+cropped, recompressed. The system makes one call, real vs AI, and it has to hold
+up across that degradation.**
+
+|  | untampered | tampered (degraded) |
+|---|---|---|
+| **real** | real, clean | real, degraded |
+| **AI** | AI, clean | AI, degraded |
+
+This matters for how SID-Set is read. Its label 2 is **not** a third class: it is
+an AI image whose AI content occupies only part of the frame. That makes it the
+*hardest AI case* — and the entire reason a localisation layer exists, since a
+whole-image score averages a small AI region into invisibility.
+
+**Localisation is a means, not an end.** Per-pixel map AUC and mask IoU are
+diagnostics that explain behaviour. They are not success criteria. The only
+metric that decides anything is AUC(real vs AI).
+
+| # | Condition | Target | Base model |
+|---|---|---|---|
+| 1 | AUC(real vs AI), clean | ≥ 0.90 | 0.739 |
+| 2 | AUC(real vs AI), worst degradation | ≥ 0.85 | 0.674 |
+| 3 | AUC on the **partially-AI** subset | ≥ 0.80 | 0.589 |
+| 4 | FPR on real images at 80% recall | ≤ 0.10 | 0.492 |
+| 5 | Region-aware beats whole-image on all AI | significant | +0.018, n.s. |
+
+Condition 5 is the project's thesis. Condition 3 is where it is actually lost:
+a whole-image detector scores **0.508 — chance — on partially-AI images**, which
+is the gap the region machinery exists to close.
+
+Measured across the 14 degradation conditions, AUC(real vs AI) stays in
+0.674–0.802 against 0.782 clean. **Degradation is not currently the binding
+constraint. Partially-AI images are.**
+
 ## The primary experiment: does the idea work?
 
 Everything else here characterises the pipeline. This one tests the thesis, in
@@ -277,10 +314,16 @@ python eval/fetch_sid_set.py --split train --shard 0 --shards 6 \
 #    python eval/fetch_sid_set.py --split train --shard 0 --shards 40 \
 #        --per_class 250 --out eval_data/sid_set_train
 
-# 2. fine-tune. Raise batch_size to fill a bigger card.
+# 2. fine-tune. Raise batch_size to fill a bigger card. --hard_negatives is the
+#    lever on false positives; raise it if real images keep tripping.
 python scripts/train_patch_scorer.py \
     --data eval_data/sid_set_train --out checkpoints/patch_scorer \
-    --epochs 3 --per_image 4 --batch_size 32
+    --epochs 3 --per_image 4 --batch_size 32 --hard_negatives 512
+
+# 2b. how should the map become a decision? The thresholds in configs/ were set
+#     when the map had no spatial signal, so re-fit them against the objective
+#     rather than trusting them on a map that now does.
+python scripts/fit_decision.py --backend checkpoints/patch_scorer --limit 50
 
 # 3. score it on the split it never saw
 python eval/fetch_sid_set.py --split validation --shard 0 --per_class 120 \
@@ -293,19 +336,35 @@ python eval/ablation.py eval_results/patch_scorer.json
 `--backend` accepts a local directory, so a trained checkpoint drops in with no
 other change.
 
-**Judge it on per-pixel map AUC, not patch accuracy.** The script prints both and
-refuses to endorse the model as a localiser if the map stays near chance. A
-model can rank patches well globally and still produce a useless map, because
-what the mapper needs is that patches *inside* an edit outrank patches *outside*
-it **within the same image**. Patch accuracy is exactly the metric that would let
-us declare success without having earned it. The base model's numbers to beat:
+**Judge it on AUC(real vs AI), not on patch accuracy and not on map AUC.** The
+script now prints all three each epoch, and they can disagree sharply — that
+disagreement is the most informative thing it produces:
 
-| Metric | base model |
-|---|---|
-| Per-pixel map AUC vs masks | **0.460** (below chance) |
-| Patch AUC on mask-labelled patches | **0.335** (below chance) |
-| Localisation mean IoU | 0.074 |
-| Tampered detection AUC | 0.589 |
+| Metric | What it measures | Trap |
+|---|---|---|
+| Patch AUC | global patch ranking | a model can ace it and still flag every real photo |
+| Per-pixel map AUC | ranking *within* one image | invariant to absolute level, so real images can float above the threshold while scoring 0.95 here |
+| **AUC(real vs AI)** | **the objective** | — |
+
+The first local run made that concrete: per-pixel map AUC went 0.460 → **0.955**,
+and real photographs still averaged 0.537 against partially-AI images at 0.311.
+Excellent within-image ranking, wrong absolute level. Hence
+`--hard_negatives`, which re-shows the real-image patches the model scores
+highest — every false positive is one of those.
+
+Numbers from the 1,800-image local run, on 30 held-out images per class:
+
+| Metric | base | patch-trained (1.8k images) |
+|---|---|---|
+| **AUC(real vs AI)** | 0.771 | **0.802** |
+| ├ fully-AI subset | 0.893 | **1.000** |
+| └ **partially-AI subset** | 0.648 | **0.604** ⚠ |
+| mean score, real images | 0.539 | 0.470 |
+| Per-pixel map AUC (diagnostic) | 0.460 | 0.955 |
+
+Training fixed the easy half and lost ground on the hard half. **Getting the
+partially-AI subset up is the open problem**, and it is what more data plus hard
+negatives is expected to help with — verify it rather than assume it.
 
 ## The known ceiling
 
