@@ -30,6 +30,8 @@ import json
 import os
 from pathlib import Path
 
+import warnings
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -40,6 +42,43 @@ from data_io import CanonicalInferenceDataset, canonical_transform, collate_unla
 from features.pipeline import FeatureStack
 
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "best.pt"
+
+def _warn_if_quickgelu_stale(bundle: dict) -> None:
+    """Flag checkpoints whose CLIP features predate the QuickGELU activation fix.
+
+    features/clip.py used to build open_clip's plain "ViT-B-16" config with
+    pretrained="openai", whose weights were trained with QuickGELU -- open_clip only
+    warns, then silently runs the wrong activation. Features shift by ~0.235 relative
+    L2, so a classifier fitted on the old features is being served new ones. The
+    existing dimension check cannot catch this: the feature width is identical.
+
+    Re-extract and refit to clear this; it needs no retraining of the backbones,
+    which are frozen.
+    """
+    clip_cfg = (bundle.get("features_config") or {}).get("clip") or {}
+    if not clip_cfg.get("enabled", False):
+        return
+    stored = clip_cfg.get("backbone_name")
+    try:
+        from features.clip import _resolve_quickgelu
+
+        resolved = _resolve_quickgelu(stored, clip_cfg.get("pretrained", ""))
+    except Exception:
+        return
+    if stored is not None and resolved != stored:
+        warnings.warn(
+            f"checkpoint's CLIP features were extracted with {stored!r} + "
+            f"pretrained={clip_cfg.get('pretrained')!r}, which mismatched the "
+            f"pretrained weights' QuickGELU activation. This build now correctly "
+            f"resolves to {resolved!r}, so the served features differ from the ones "
+            f"the classifier was fitted on. Re-extract features and refit the "
+            f"classifier before trusting these scores.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+
 
 # Building the stack instantiates (and on a cold cache downloads) the frozen
 # DINOv2/CLIP backbones, which is far too slow to redo per upload, so the loaded
@@ -75,6 +114,7 @@ def load_model(
     # weights_only=False: the bundle intentionally carries the scaler arrays, the
     # feature config and (for xgboost) the raw booster bytes, not just tensors.
     bundle = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    _warn_if_quickgelu_stale(bundle)
     stack = FeatureStack.from_config(bundle["features_config"], device=device)
     predictor = load_predictor(bundle)
 

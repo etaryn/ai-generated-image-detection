@@ -34,6 +34,27 @@ _HF_EQUIVALENT = {
 }
 
 
+# open_clip exposes the QuickGELU towers as separate model configs. Only the
+# "openai" tag needs them; LAION tags were trained with standard GELU and must NOT
+# be remapped.
+_QUICKGELU_TAGS = {"openai"}
+
+
+def _resolve_quickgelu(backbone_name: str, pretrained: str) -> str:
+    """Return the model config matching `pretrained`'s activation, if one exists."""
+    if pretrained not in _QUICKGELU_TAGS or backbone_name.endswith("-quickgelu"):
+        return backbone_name
+    try:
+        import open_clip
+
+        candidate = f"{backbone_name}-quickgelu"
+        if candidate in set(open_clip.list_models()):
+            return candidate
+    except Exception:
+        pass
+    return backbone_name
+
+
 class ClipFeatures(FeatureExtractor):
     name = "clip"
 
@@ -54,7 +75,15 @@ class ClipFeatures(FeatureExtractor):
         try:
             import open_clip
 
-            model, _, _ = open_clip.create_model_and_transforms(backbone_name, pretrained=pretrained)
+            # OpenAI's CLIP weights were trained with QuickGELU. open_clip's plain
+            # "ViT-B-16" config uses standard GELU, so loading pretrained="openai"
+            # into it silently mismatches the activation -- open_clip only warns.
+            # Measured cost on ViT-B-16: cosine 0.974 / relative L2 0.235 against
+            # the correct tower. Resolve to the -quickgelu config when the tag needs
+            # it and one exists.
+            resolved = _resolve_quickgelu(backbone_name, pretrained)
+            model, _, _ = open_clip.create_model_and_transforms(resolved, pretrained=pretrained)
+            self.resolved_backbone_name = resolved
             # Keep only the vision tower (as model_01/model/backbone.py does): the
             # text encoder is ~63M parameters this pipeline never calls, and there
             # is no reason to carry it into GPU memory during extraction.
