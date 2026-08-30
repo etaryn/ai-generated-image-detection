@@ -143,20 +143,132 @@ def batched(items, size):
 
 
 def evaluate_patches(model, processor, device, patches, labels, batch_size=64) -> float:
+    """Patch-level AUC, reading P(AI) from the class the model *says* is AI.
+
+    The index is resolved from the model's own id2label, never hardcoded. An
+    earlier version of this function took logit index 1, which on a model whose
+    AI class sits at index 0 reported a well-trained scorer as AUC 0.02 -- the
+    exact inversion mapper/labels.py exists to prevent, reintroduced here by
+    hand. Reading a *trained* model as broken is the benign direction of that
+    mistake; the other direction ships an inverted detector.
+    """
     import torch
 
     from eval.evaluate import auc
+    from mapper.labels import resolve_positive_indices
+
+    positive, _ = resolve_positive_indices(model.config.id2label)
 
     model.eval()
     scores = []
     with torch.no_grad():
         for chunk in batched(patches, batch_size):
             inputs = processor(images=list(chunk), return_tensors="pt").to(device)
-            logits = model(**inputs).logits.float().softmax(-1)
-            scores.extend(logits[:, 1].cpu().tolist())
+            probs = model(**inputs).logits.float().softmax(-1)
+            scores.extend(probs[:, positive].sum(dim=-1).cpu().tolist())
     scores = np.array(scores)
     labels = np.array(labels)
     return auc(scores[labels == 1], scores[labels == 0])
+
+
+def evaluate_objective(model, processor, device, root: Path, items: list[dict],
+                       scales: list[int], limit: int = 40, per_image: int = 12) -> dict:
+    """AUC(real vs AI) at image level -- the actual objective.
+
+    The system makes one binary call: real or AI. Patch AUC does not measure it,
+    and per-pixel map AUC measures only *within-image* ranking, which a model can
+    ace while every real photograph still floats above the decision threshold --
+    exactly the failure observed after the first training run (real images
+    averaging 0.537 against partially-AI images at 0.311).
+
+    So this reduces each validation image to a single score the way the pipeline
+    effectively does -- a high percentile over a patch grid -- and asks whether
+    real images separate from AI ones. Both AI subsets are reported, because the
+    partially-AI subset is the one a whole-image detector cannot see and the
+    whole reason the region machinery exists.
+    """
+    import torch
+
+    from eval.evaluate import auc
+    from mapper.labels import resolve_positive_indices
+    from mapper.windows import plan_windows
+
+    positive, _ = resolve_positive_indices(model.config.id2label)
+    model.eval()
+    rng = random.Random(0)
+
+    scores: dict[str, list[float]] = {"real": [], "synthetic": [], "tampered": []}
+    picked: dict[str, int] = {}
+    with torch.no_grad():
+        for row in items:
+            cls = row["class"]
+            if picked.get(cls, 0) >= limit:
+                continue
+            with Image.open(root / row["image"]) as handle:
+                image = handle.convert("RGB")
+            plan = plan_windows(image.width, image.height, scales, overlap=0.5)
+            windows = [w for group in plan.values() for w in group]
+            rng.shuffle(windows)
+            crops = [image.crop(w.box) for w in windows[:per_image]]
+            if not crops:
+                continue
+            inputs = processor(images=crops, return_tensors="pt").to(device)
+            probs = model(**inputs).logits.float().softmax(-1)
+            patch_scores = probs[:, positive].sum(dim=-1).cpu().numpy()
+            scores[cls].append(float(np.percentile(patch_scores, 90)))
+            picked[cls] = picked.get(cls, 0) + 1
+
+    real = np.array(scores["real"])
+    full = np.array(scores["synthetic"])
+    part = np.array(scores["tampered"])
+    ai = np.concatenate([full, part]) if full.size or part.size else np.array([])
+    if real.size == 0 or ai.size == 0:
+        return {}
+    return {
+        "auc_real_vs_ai": auc(ai, real),
+        "auc_real_vs_fully_ai": auc(full, real) if full.size else float("nan"),
+        "auc_real_vs_partially_ai": auc(part, real) if part.size else float("nan"),
+        "mean_real": float(real.mean()),
+        "mean_partially_ai": float(part.mean()) if part.size else float("nan"),
+    }
+
+
+def mine_hard_negatives(model, processor, device, sampler, root: Path,
+                        real_items: list[dict], want: int, batch_size: int = 64):
+    """Real-image patches the model currently scores highest, as extra negatives.
+
+    Every false positive the system produces is a patch of an authentic
+    photograph scoring high. Random negatives mostly teach what the model
+    already knows; the patches it gets wrong are the ones carrying information,
+    and re-showing them is the cheapest available pressure on the false-positive
+    rate -- the failing condition under the real-vs-AI objective.
+    """
+    import torch
+
+    from mapper.labels import resolve_positive_indices
+
+    if want <= 0 or not real_items:
+        return []
+
+    positive, _ = resolve_positive_indices(model.config.id2label)
+    candidates: list[Image.Image] = []
+    for row in real_items:
+        candidates.extend(patch for patch, _ in sampler.draw(row))
+        if len(candidates) >= want * 4:
+            break
+    if not candidates:
+        return []
+
+    model.eval()
+    scored = []
+    with torch.no_grad():
+        for chunk in batched(candidates, batch_size):
+            inputs = processor(images=list(chunk), return_tensors="pt").to(device)
+            probs = model(**inputs).logits.float().softmax(-1)
+            scored.extend(probs[:, positive].sum(dim=-1).cpu().tolist())
+
+    order = np.argsort(scored)[::-1][:want]
+    return [(candidates[i], 0) for i in order]
 
 
 def evaluate_map(model_dir: Path, root: Path, items: list[dict], limit: int = 12) -> dict:
@@ -220,6 +332,11 @@ def main():
     parser.add_argument("--val_frac", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--limit_images", type=int, default=None)
+    parser.add_argument("--hard_negatives", type=int, default=512,
+                        help="Real-image patches the model scores highest, re-shown as "
+                             "negatives next epoch. Every false positive is one of these, "
+                             "and false positives are the failing condition under the "
+                             "real-vs-AI objective. 0 disables.")
     args = parser.parse_args()
 
     import torch
@@ -282,12 +399,16 @@ def main():
     except ImportError:
         tqdm = None
 
+    real_items = [r for r in train_items if r["class"] == "real"]
+    hard_negatives: list[tuple[Image.Image, int]] = []
+
     for epoch in range(args.epochs):
         model.train()
         order = list(train_items)
         rng.shuffle(order)
 
-        pool: list[tuple[Image.Image, int]] = []
+        # Carry the previous epoch's worst false positives back in.
+        pool: list[tuple[Image.Image, int]] = list(hard_negatives)
         losses = []
         iterator = tqdm(order, desc=f"epoch {epoch + 1}/{args.epochs}", unit="img") if tqdm else order
 
@@ -317,7 +438,23 @@ def main():
                 iterator.set_postfix({"loss": f"{np.mean(losses[-50:]):.4f}"})
 
         patch_auc = evaluate_patches(model, processor, device, val_patches, val_labels)
-        print(f"epoch {epoch + 1}: loss {np.mean(losses):.4f}  patch AUC {patch_auc:.4f}", flush=True)
+        objective = evaluate_objective(
+            model, processor, device, root, val_items, args.scales
+        )
+        print(
+            f"epoch {epoch + 1}: loss {np.mean(losses):.4f}  patch AUC {patch_auc:.4f}  "
+            f"AUC(real vs AI) {objective.get('auc_real_vs_ai', float('nan')):.4f}  "
+            f"[partial {objective.get('auc_real_vs_partially_ai', float('nan')):.4f}, "
+            f"real {objective.get('mean_real', float('nan')):.3f} vs "
+            f"partial {objective.get('mean_partially_ai', float('nan')):.3f}]",
+            flush=True,
+        )
+
+        if args.hard_negatives > 0 and epoch + 1 < args.epochs:
+            hard_negatives = mine_hard_negatives(
+                model, processor, device, sampler, root, real_items, args.hard_negatives
+            )
+            print(f"  mined {len(hard_negatives)} hard negatives from real images", flush=True)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
