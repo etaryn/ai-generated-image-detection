@@ -182,6 +182,7 @@ def main():
         "block_spec": block_spec,
         "feature_names": feature_names,
         "features_config": cache["meta"]["config"]["features"],
+        "resolved_backbones": cache["meta"].get("resolved_backbones"),
         "canonical_size": cache["meta"]["config"]["data"]["canonical_size"],
         "blocks_used": args.blocks,
         # Column indices into the FULL extracted vector. infer.py always runs the

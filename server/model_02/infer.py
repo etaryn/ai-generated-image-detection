@@ -43,41 +43,61 @@ from features.pipeline import FeatureStack
 
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "best.pt"
 
-def _warn_if_quickgelu_stale(bundle: dict) -> None:
-    """Flag checkpoints whose CLIP features predate the QuickGELU activation fix.
+def _warn_if_backbone_mismatch(bundle: dict, stack: FeatureStack) -> None:
+    """Flag a checkpoint whose features were produced by a different tower than the
+    one about to serve it.
 
-    features/clip.py used to build open_clip's plain "ViT-B-16" config with
-    pretrained="openai", whose weights were trained with QuickGELU -- open_clip only
-    warns, then silently runs the wrong activation. Features shift by ~0.235 relative
-    L2, so a classifier fitted on the old features is being served new ones. The
-    existing dimension check cannot catch this: the feature width is identical.
+    The motivating case is the QuickGELU activation. features/clip.py used to build
+    open_clip's plain "ViT-B-16" config with pretrained="openai", whose weights were
+    trained with QuickGELU -- open_clip only warns, then silently runs the wrong
+    activation. Features shift by ~0.235 relative L2, so a classifier fitted on the
+    old features is being served new ones, and the dimension check cannot catch it
+    because the width is identical.
 
-    Re-extract and refit to clear this; it needs no retraining of the backbones,
-    which are frozen.
+    The comparison is against `stack`, the extractor set this process just built, so
+    it reflects what will actually run rather than a second derivation of it. The
+    checkpoint side comes from `resolved_backbones`, recorded at extraction time.
+
+    An earlier version of this check compared the checkpoint's *requested* backbone
+    name against the resolved one. That fires on every checkpoint ever written --
+    the config records "ViT-B-16" whether or not the fix is in effect -- so it
+    warned on correct and stale checkpoints alike and told you nothing. A missing
+    `resolved_backbones` is now the stale signal, since only caches written before
+    the field existed lack it, and those are exactly the pre-fix ones.
     """
-    clip_cfg = (bundle.get("features_config") or {}).get("clip") or {}
-    if not clip_cfg.get("enabled", False):
+    if not ((bundle.get("features_config") or {}).get("clip") or {}).get("enabled", False):
         return
-    stored = clip_cfg.get("backbone_name")
-    try:
-        from features.clip import _resolve_quickgelu
+    serving = stack.resolved_backbones()
+    recorded = bundle.get("resolved_backbones")
 
-        resolved = _resolve_quickgelu(stored, clip_cfg.get("pretrained", ""))
-    except Exception:
-        return
-    if stored is not None and resolved != stored:
+    if recorded is None:
         warnings.warn(
-            f"checkpoint's CLIP features were extracted with {stored!r} + "
-            f"pretrained={clip_cfg.get('pretrained')!r}, which mismatched the "
-            f"pretrained weights' QuickGELU activation. This build now correctly "
-            f"resolves to {resolved!r}, so the served features differ from the ones "
-            f"the classifier was fitted on. Re-extract features and refit the "
-            f"classifier before trusting these scores.",
+            "checkpoint does not record which backbones extracted its features, so it "
+            "predates the QuickGELU activation fix: its CLIP features were almost "
+            "certainly produced by the plain 'ViT-B-16' tower running standard GELU "
+            "against QuickGELU-trained weights, while this build serves the correct "
+            f"tower ({serving.get('clip')!r}). Re-extract features and refit the "
+            "classifier before trusting these scores. The backbones are frozen, so "
+            "this costs an extraction pass, not a retrain.",
             RuntimeWarning,
             stacklevel=2,
         )
+        return
 
-
+    differing = {
+        name: (was, now)
+        for name, now in serving.items()
+        if (was := recorded.get(name)) is not None and was != now
+    }
+    if differing:
+        detail = "; ".join(f"{n}: fitted on {w!r}, serving {s!r}" for n, (w, s) in differing.items())
+        warnings.warn(
+            f"checkpoint's features were extracted with a different backbone than this "
+            f"build serves ({detail}). The feature width is unchanged, so nothing else "
+            f"catches this. Re-extract and refit before trusting these scores.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 # Building the stack instantiates (and on a cold cache downloads) the frozen
@@ -114,8 +134,8 @@ def load_model(
     # weights_only=False: the bundle intentionally carries the scaler arrays, the
     # feature config and (for xgboost) the raw booster bytes, not just tensors.
     bundle = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    _warn_if_quickgelu_stale(bundle)
     stack = FeatureStack.from_config(bundle["features_config"], device=device)
+    _warn_if_backbone_mismatch(bundle, stack)
     predictor = load_predictor(bundle)
 
     _LOADED[key] = (bundle, stack, predictor, device)

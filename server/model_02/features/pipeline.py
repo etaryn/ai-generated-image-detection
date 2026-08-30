@@ -124,3 +124,17 @@ class FeatureStack:
             "blocks": self.block_spec(),
             "extractors": [ex.signature() for ex in self.extractors],
         }
+
+    def resolved_backbones(self) -> dict:
+        """Which concrete backbone each extractor actually ran, by block name.
+
+        Kept as its own top-level cache field rather than read back out of
+        signature()["extractors"], because train.py stores the *pruned* block spec
+        (--blocks fft drops the clip entry) and infer.py still has to be able to
+        ask what the clip features were extracted with.
+        """
+        return {
+            ex.name: ex.resolved_backbone_name
+            for ex in self.extractors
+            if getattr(ex, "resolved_backbone_name", None)
+        }

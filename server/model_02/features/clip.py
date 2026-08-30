@@ -102,6 +102,12 @@ class ClipFeatures(FeatureExtractor):
                 )
             self.model = CLIPVisionModelWithProjection.from_pretrained(hf_name).eval().to(self.device)
             self.impl = "transformers"
+            # HF reads `hidden_act` from the checkpoint's own config, so the OpenAI
+            # weights get QuickGELU here without any remapping. Record the HF id
+            # rather than an open_clip config name -- the two are different towers,
+            # and a cache extracted under one but served under the other is worth
+            # flagging even though both activations are right.
+            self.resolved_backbone_name = f"hf:{hf_name}"
             self.dim = self.model.config.projection_dim
 
         for p in self.model.parameters():
@@ -131,4 +137,8 @@ class ClipFeatures(FeatureExtractor):
             "image_size": self.image_size,
             "l2_normalize": self.l2_normalize,
             "impl": self.impl,
+            # The tower that actually ran, after QuickGELU resolution. `backbone_name`
+            # above is the requested config and stays "ViT-B-16" either way, so it
+            # cannot answer which activation produced these features.
+            "resolved_backbone_name": self.resolved_backbone_name,
         }

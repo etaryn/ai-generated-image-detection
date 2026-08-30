@@ -248,6 +248,11 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     meta = {
         "features": stack.signature(),
+        # Provenance for the served-vs-fitted activation check in infer.py. Absent
+        # on any cache written before this field existed, which is exactly the set
+        # of caches that predate the QuickGELU fix -- so infer.py treats a missing
+        # key as stale rather than as "fine".
+        "resolved_backbones": stack.resolved_backbones(),
         "feature_names": stack.feature_names(),
         "config": {"data": cfg["data"], "features": cfg["features"]},
         "aug_copies": aug_copies,
