@@ -234,29 +234,83 @@ def conclude(detection: dict, matched: dict, capabilities: dict) -> list[str]:
     if kind_parts:
         lines.append("KIND (no baseline equivalent): " + ", ".join(kind_parts) + ".")
 
-    # The overall read, stated once, so the answer to "does our idea work?" is
-    # not left to the reader to assemble from four separate numbers.
-    helps_detection = bool(tampered) and tampered["significant"] and tampered["delta"] > 0
-    localises = bool(loc) and loc["touch_rate"] >= 0.5
-    if helps_detection and localises:
-        lines.append("OVERALL: the idea works on this evidence -- it detects better AND localises.")
-    elif localises:
+    # A regression elsewhere is part of the answer. The region machinery can buy
+    # tampered detection by spending synthetic detection, and reporting only the
+    # column that improved would be the oldest trick in benchmarking.
+    synthetic = detection.get("synthetic", {})
+    if synthetic and synthetic["significant"]:
+        direction = "gains" if synthetic["delta"] > 0 else "LOSES"
         lines.append(
-            "OVERALL: the idea earns its place on localisation and kind, not on detection. "
-            "It finds where the edit is, which the baseline cannot do at all, while scoring "
-            "about the same at the image level."
+            f"SYNTHETIC (where the thesis predicts no benefit -- nothing to localise): "
+            f"the region-aware arm {direction} {abs(synthetic['delta']):.3f} AUC "
+            f"({synthetic['auc_without']:.3f} -> {synthetic['auc_with']:.3f})."
         )
-    elif helps_detection:
-        lines.append(
-            "OVERALL: detection improves but localisation is weak, so the regions are acting "
-            "as a scoring trick rather than as an explanation. Treat the maps with caution."
+
+    # The overall read, stated once, so the answer to "does our idea work?" is
+    # not left to the reader to assemble from five separate numbers.
+    #
+    # The bar is deliberately not just "did the delta clear zero". A
+    # statistically significant +0.08 on top of a chance-level baseline is a
+    # real directional result and still a weak detector, and a conclusion rule
+    # that called that "works" would be flattering its own project. So absolute
+    # performance has to clear a floor too, and a regression elsewhere is named
+    # rather than netted out.
+    helped = bool(tampered) and tampered["significant"] and tampered["delta"] > 0
+    hurt = bool(tampered) and tampered["significant"] and tampered["delta"] < 0
+    strong_detection = bool(tampered) and tampered["auc_with"] >= 0.75
+    localises = bool(loc) and loc["touch_rate"] >= 0.5
+    localises_well = bool(loc) and loc["mean_iou"] >= 0.25
+    regressed = bool(synthetic) and synthetic["significant"] and synthetic["delta"] < -0.02
+
+    fpr = (matched or {}).get("with", {}).get("false_positive_rate")
+    unusable_fpr = fpr is not None and fpr > 0.25
+
+    if helped and strong_detection and localises_well:
+        verdict = "the idea works on this evidence -- it detects better AND localises well."
+    elif helped and (localises or localises_well):
+        verdict = (
+            "the idea is DIRECTIONALLY VALIDATED but not yet usable. The gain over "
+            "whole-image scoring is real and significant, and the baseline is at or near "
+            "chance on exactly the case this was built for -- but the absolute numbers "
+            "(AUC {auc:.3f}, mean IoU {iou:.3f}) are too weak to act on."
+        ).format(auc=tampered["auc_with"], iou=(loc or {}).get("mean_iou", float("nan")))
+    elif helped:
+        verdict = (
+            "detection improves but localisation misses more often than it lands, so the "
+            "regions are acting as a scoring trick rather than as an explanation. Do not "
+            "present the maps to users on this evidence."
+        )
+    elif hurt:
+        verdict = (
+            "the idea does NOT work in its current form -- the region machinery is "
+            "DISCARDING signal the whole-image score already had."
+        )
+    elif localises_well:
+        # No detection gain, but it reliably finds the edit. That is still worth
+        # having: the baseline cannot do it at any threshold, and "where" is
+        # what a reviewer actually needs to act on a flag.
+        verdict = (
+            "the idea earns its place on localisation, not on detection. It finds where "
+            "the edit is -- which the baseline cannot do at all -- while scoring about the "
+            "same at the image level."
         )
     else:
+        verdict = (
+            "on this evidence the idea does NOT yet work -- no measurable detection gain, "
+            "and localisation misses more often than it lands."
+        )
+
+    lines.append("OVERALL: " + verdict)
+    if regressed:
         lines.append(
-            "OVERALL: on this evidence the idea does NOT yet work -- no detection gain and "
-            "localisation misses more often than it lands. See EVALUATION.md's 'known "
-            "ceiling': every backend here is trained on whole images and is being asked "
-            "about small crops."
+            "  ...and it is a TRADE, not a free win: tampered detection was bought at a "
+            "significant cost to synthetic detection. Whether that trade is worth making "
+            "depends on which error is more expensive for the use case."
+        )
+    if unusable_fpr:
+        lines.append(
+            f"  ...and the operating point is not deployable regardless: {fpr:.0%} of "
+            f"authentic photographs are flagged at the recall measured above."
         )
     return lines
 

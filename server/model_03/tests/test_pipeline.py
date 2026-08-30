@@ -242,6 +242,38 @@ def test_disagreeing_specialists_lower_confidence():
     )
 
 
+def test_strong_global_evidence_reads_as_generated_not_edited():
+    """Regression: measured on SID-Set, only 4% of wholly generated images were
+    labelled `ai_generated` -- 84% came back `ai_edited` -- even though the
+    whole-image detector separated them from real photographs at AUC 0.935.
+
+    The old rule demanded a synthesis-routed region covering half the frame
+    before it would say "generated", which threw away global evidence the
+    detector had already produced. The verdict now follows whichever hypothesis
+    won the max() in `fuse`.
+    """
+    from fusion import _verdict
+
+    verdict = _verdict(
+        score=0.99, confidence=0.8, findings=[1], synthesis_findings=[],
+        conventional=[], coverage=0.2, min_confidence=0.35, decide_at=0.5,
+        whole_image_score=0.99, local_score=0.62,
+    )
+    assert verdict == "ai_generated", verdict
+
+
+def test_strong_local_evidence_still_reads_as_edited():
+    """The other side of the same rule: a localised edit must not become 'generated'."""
+    from fusion import _verdict
+
+    verdict = _verdict(
+        score=0.88, confidence=0.8, findings=[1], synthesis_findings=[],
+        conventional=[], coverage=0.1, min_confidence=0.35, decide_at=0.5,
+        whole_image_score=0.30, local_score=0.88,
+    )
+    assert verdict == "ai_edited", verdict
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

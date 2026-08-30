@@ -222,6 +222,8 @@ def fuse(
         coverage=coverage,
         min_confidence=min_confidence,
         decide_at=decide_at,
+        whole_image_score=whole_image_score,
+        local_score=local_score if findings else None,
     )
 
     explanation = _explain(
@@ -260,11 +262,27 @@ def _verdict(
     coverage: float,
     min_confidence: float,
     decide_at: float,
+    whole_image_score: float,
+    local_score: float | None,
 ) -> str:
     if confidence < min_confidence:
         return "uncertain"
     if score < decide_at:
         return "likely_authentic" if not findings else "likely_authentic_with_open_questions"
+
+    # Which hypothesis actually explained the image? `fuse` already chose
+    # between them with a max(), so the verdict should follow that choice rather
+    # than re-deciding on a separate threshold.
+    #
+    # The previous rule required a synthesis-routed region covering >=50% of the
+    # frame, and measured on SID-Set it almost never fired: only 4% of wholly
+    # generated images were labelled `ai_generated`, with 84% mislabelled
+    # `ai_edited` -- even though the whole-image detector separated those images
+    # from real ones at AUC 0.935. The global evidence was there; the verdict
+    # rule was throwing it away by insisting the *map* prove it too.
+    global_won = local_score is None or whole_image_score >= local_score
+    if global_won and whole_image_score >= decide_at:
+        return "ai_generated"
     if synthesis_findings and coverage >= 0.5:
         return "ai_generated"
     if conventional and len(conventional) >= max(1, len(findings) // 2 + len(findings) % 2):
