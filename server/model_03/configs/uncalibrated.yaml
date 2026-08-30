@@ -1,0 +1,16 @@
+# The shipped default, minus calibration.
+#
+# Exists so the effect of calibration can be measured rather than assumed: run
+# eval/evaluate.py once with configs/default.yaml and once with this, on the
+# same images, and the difference is what the calibrators bought.
+#
+# It is also the correct config for a backend you have not fitted calibrators
+# for. A calibrator is valid only for the backend and the scales it was fitted
+# on -- carrying one across backends is worse than having none, because the map
+# then looks calibrated while being wrong.
+#
+# Running this way caps reported confidence at 0.60 and says so in every
+# report's `notes`, which is the honest state rather than a hidden default.
+
+mapper:
+  calibration_path: null

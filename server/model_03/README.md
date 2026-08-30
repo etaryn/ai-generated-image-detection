@@ -332,6 +332,16 @@ image, and `ai_edited` (0.74) for the locally edited one.
 
 ---
 
+## Evaluation
+
+`tests/` answers *does the machinery do what it says?*. **[EVALUATION.md](EVALUATION.md)**
+answers *is it actually right?* — detection, localisation against ground-truth
+tamper masks, false positives on authentic photographs, verdict confusion and a
+robustness matrix, all against SID-Set, with the exact commands to reproduce
+them and the knobs for running at a larger scale.
+
+Read that before quoting any accuracy number from this project.
+
 ## Known weaknesses
 
 Ordered by how much they should change your reading of an output.
