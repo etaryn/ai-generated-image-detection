@@ -75,10 +75,22 @@ mapper:
   # rather than trusted.
   min_support: 0.15
 
-  # Path to a fitted calibrator (scripts/calibrate_mapper.py). While this is
-  # null the map is uncalibrated, its thresholds are nominal, and fusion caps
-  # the reported confidence at 0.60 and says so in the explanation.
-  calibration_path: null
+  # Fitted calibrators, one per scale (scripts/calibrate_mapper.py). Set this to
+  # null to run uncalibrated, in which case the thresholds are nominal and
+  # fusion caps reported confidence at 0.60 and says so in the explanation.
+  #
+  # The shipped file was fitted on SID-Set validation shard 1 -- deliberately a
+  # different shard from the one eval/ scores against -- with tampered patches
+  # labelled by whether their centre falls inside the tamper mask. Held-out ECE:
+  #
+  #     64px   0.234 -> 0.089
+  #     128px  0.221 -> 0.080
+  #     224px  0.191 -> 0.071
+  #
+  # It is valid ONLY for hf:Organika/sdxl-detector at scales [64, 128, 224].
+  # Change either and refit, or set this to null; a calibrator carried across
+  # backends is worse than none.
+  calibration_path: configs/calibration_sdxl_detector.json
 
 regions:
   min_area_frac: 0.004    # below this a component is patch jitter, not an object

@@ -46,6 +46,15 @@ from analyze import RegionAwareAnalyzer, load_config  # noqa: E402
 from eval.evaluate import auc, mask_metrics, predicted_mask  # noqa: E402
 
 
+def _bar(total: int):
+    """One bar across the whole matrix, since per-condition bars flicker past."""
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return None
+    return tqdm(total=total, desc="robustness", unit="run", dynamic_ncols=True)
+
+
 def jpeg(image: Image.Image, quality: int) -> Image.Image:
     buf = BytesIO()
     image.save(buf, format="JPEG", quality=int(quality))
@@ -132,6 +141,8 @@ def main():
     results = {}
     clean_verdicts: dict[str, str] = {}
 
+    bar = _bar(len(CONDITIONS) * len(items))
+
     for cond_name, transform, severity in CONDITIONS:
         rows = []
         for row in items:
@@ -139,6 +150,9 @@ def main():
             image = transform(images[stem])
             report = analyzer.analyse(image)
             pred = predicted_mask(report, image.size)
+            if bar is not None:
+                bar.set_postfix({"condition": cond_name}, refresh=False)
+                bar.update(1)
 
             record = {
                 "stem": stem,
@@ -189,6 +203,9 @@ def main():
             f"loc_recall={(r['mean_localisation_recall'] or 0):.3f}",
             flush=True,
         )
+
+    if bar is not None:
+        bar.close()
 
     describe = getattr(analyzer.scorer, "describe", None)
     payload = {

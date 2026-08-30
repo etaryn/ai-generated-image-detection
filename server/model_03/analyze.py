@@ -29,7 +29,7 @@ from pathlib import Path
 from PIL import Image
 
 from fusion import FusedVerdict, RegionFinding, fuse, fuse_region
-from mapper.calibration import Calibrator
+from mapper.calibration import ScaleCalibrators
 from mapper.heatmap import AILikelihoodMap, AILikelihoodMapper
 from regions.proposals import extract_regions
 from router import Router
@@ -87,6 +87,23 @@ DEFAULTS: dict = {
     },
     "fusion": {"min_confidence": 0.35, "decide_at": 0.5},
 }
+
+
+def _resolve_path(path: str | Path | None) -> Path | None:
+    """Resolve a config path relative to model_03/, not to the caller's cwd.
+
+    The config names `configs/calibration_*.json`, and the Streamlit client
+    imports this package from the repository root while the CLI runs from
+    inside model_03. Resolving against cwd would make the same config load a
+    calibrator in one case and silently fail in the other.
+    """
+    if not path:
+        return None
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    local = Path(__file__).resolve().parent / candidate
+    return local if local.exists() else candidate
 
 
 def _merge(base: dict, override: dict | None) -> dict:
@@ -161,7 +178,7 @@ class RegionAwareAnalyzer:
         self.scorer = scorer
 
         mapper_cfg = dict(self.config["mapper"])
-        calibrator = Calibrator.load(mapper_cfg.pop("calibration_path", None))
+        calibrator = ScaleCalibrators.load(_resolve_path(mapper_cfg.pop("calibration_path", None)))
         self.mapper = AILikelihoodMapper(scorer=self.scorer, calibrator=calibrator, **mapper_cfg)
 
         routing_cfg = dict(self.config["routing"])

@@ -145,6 +145,13 @@ class AILikelihoodMapper:
         size = (max(1, int(round(rgb.width * factor))), max(1, int(round(rgb.height * factor))))
         return rgb.resize(size, Image.BICUBIC)
 
+    def _calibrate(self, scores: np.ndarray, scale: int) -> np.ndarray:
+        """Apply the calibrator, per scale when it knows about scales."""
+        try:
+            return self.calibrator.apply(scores, scale=scale)
+        except TypeError:
+            return self.calibrator.apply(scores)
+
     def _score_windows(self, image: Image.Image, windows: list[Window]) -> list[float]:
         patches = [image.crop(w.box) for w in windows]
         return self.scorer.score_patches(patches)
@@ -165,7 +172,12 @@ class AILikelihoodMapper:
             # patch scores, so it has to be applied before the blend averages
             # them (calibrate-then-average and average-then-calibrate differ
             # whenever the map is non-linear, which it is).
-            scores = self.calibrator.apply(np.asarray(scores)).tolist()
+            #
+            # It is also per *scale*. A 64px crop and a 224px crop are different
+            # questions to a detector trained on whole images, and measurably so
+            # -- see ScaleCalibrators. Passing the scale lets each one be
+            # corrected by its own fit; a plain Calibrator ignores the argument.
+            scores = self._calibrate(np.asarray(scores), scale).tolist()
             heat, support = blend_scale(height, width, windows, scores)
             per_scale[scale] = heat
             supports.append(support)

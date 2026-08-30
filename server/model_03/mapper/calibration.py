@@ -237,6 +237,93 @@ def fit_isotonic(scores, labels, max_knots: int = 64) -> Calibrator:
     )
 
 
+class ScaleCalibrators:
+    """One calibrator per window scale, because the distortion *is* scale-dependent.
+
+    Measured on SID-Set with the default backend, the fraction of patches from
+    **authentic photographs** scoring above the 0.75 "likely AI" threshold:
+
+        64px    36.6%
+        128px   16.3%
+        224px   10.4%
+
+    while patches of fully-synthetic images scored ~0.71 at every scale. So the
+    fine scale is not more sensitive to generated content -- it is more prone to
+    calling *authentic* content generated, because a 64px crop upscaled to the
+    detector's 224px input looks smooth and textureless, which is what the model
+    was trained to read as "generated".
+
+    A single calibrator cannot fix that. It applies one monotone map to every
+    patch, so pulling the 64px scale's false positives down would drag the
+    coarse scales' true positives down with them. Three separate maps, each
+    fitted on its own scale's score distribution, is the correction the data
+    actually calls for -- and it preserves what the multi-scale design is for,
+    since after calibration the scales become directly comparable and `max`
+    over them stops being dominated by whichever scale is most miscalibrated.
+
+    Falls back to the shared calibrator for any scale that was not fitted, so a
+    config that adds a fourth scale degrades rather than breaks.
+    """
+
+    def __init__(self, per_scale: dict[int, Calibrator] | None = None, shared: Calibrator | None = None):
+        self.per_scale = {int(k): v for k, v in (per_scale or {}).items()}
+        self.shared = shared or Calibrator.identity()
+
+    @property
+    def fitted(self) -> bool:
+        return bool(self.per_scale) or self.shared.fitted
+
+    def for_scale(self, scale: int) -> Calibrator:
+        return self.per_scale.get(int(scale), self.shared)
+
+    def apply(self, scores, scale: int | None = None) -> np.ndarray:
+        if scale is None:
+            return self.shared.apply(scores)
+        return self.for_scale(scale).apply(scores)
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": "per_scale",
+            "shared": self.shared.to_dict(),
+            "scales": {str(k): v.to_dict() for k, v in sorted(self.per_scale.items())},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ScaleCalibrators":
+        if not d:
+            return cls()
+        if d.get("kind") != "per_scale":
+            # A single-calibrator file stays valid: it becomes the shared map.
+            return cls(shared=Calibrator.from_dict(d))
+        return cls(
+            per_scale={int(k): Calibrator.from_dict(v) for k, v in (d.get("scales") or {}).items()},
+            shared=Calibrator.from_dict(d.get("shared")),
+        )
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2))
+
+    @classmethod
+    def load(cls, path: str | Path | None) -> "ScaleCalibrators":
+        if path is None:
+            return cls()
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(
+                f"No calibration file at {p}. Fit one with scripts/calibrate_mapper.py, "
+                f"or set mapper.calibration_path to null to run uncalibrated."
+            )
+        return cls.from_dict(json.loads(p.read_text()))
+
+    def describe(self) -> dict:
+        return {
+            "fitted": self.fitted,
+            "scales_fitted": sorted(self.per_scale),
+            "shared_fitted": self.shared.fitted,
+            "meta": {str(k): v.meta for k, v in sorted(self.per_scale.items())},
+        }
+
+
 def expected_calibration_error(probs, labels, bins: int = 10) -> float:
     """Standard ECE, for reporting how much a fit actually bought."""
     p = np.asarray(probs, dtype=np.float64).ravel()

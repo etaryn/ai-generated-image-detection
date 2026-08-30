@@ -57,6 +57,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from analyze import RegionAwareAnalyzer, load_config  # noqa: E402
 
 
+def _progress(items, description: str):
+    """A tqdm bar when tqdm is installed, the plain list when it is not."""
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return items
+    return tqdm(items, desc=description, unit="img", dynamic_ncols=True)
+
+
+def _update_progress(progress, rows: list[dict]) -> None:
+    """Show the numbers that would make someone stop the run early.
+
+    A percentage bar only says how long is left. What matters during a 40-minute
+    evaluation is whether the result is already visibly wrong -- so the bar
+    carries the running AUC and the false-positive rate on authentic images,
+    which are the two numbers a bad configuration ruins first.
+    """
+    if not hasattr(progress, "set_postfix"):
+        return
+
+    real = np.array([r["score"] for r in rows if r["class"] == "real"])
+    ai = np.array([r["score"] for r in rows if r["class"] in ("tampered", "synthetic")])
+    tampered = np.array([r["score"] for r in rows if r["class"] == "tampered"])
+    flagged = [r["n_regions"] > 0 for r in rows if r["class"] == "real"]
+
+    postfix = {}
+    if real.size and ai.size:
+        postfix["AUC"] = f"{auc(ai, real):.3f}"
+    if real.size and tampered.size:
+        postfix["AUC_tamp"] = f"{auc(tampered, real):.3f}"
+    if flagged:
+        postfix["FP"] = f"{np.mean(flagged):.2f}"
+    postfix["n"] = len(rows)
+    progress.set_postfix(postfix, refresh=False)
+
+
 def auc(positive: np.ndarray, negative: np.ndarray) -> float:
     """Rank-based AUC with ties counted as half. No sklearn dependency."""
     if positive.size == 0 or negative.size == 0:
@@ -233,7 +269,8 @@ def main():
     analyzer = RegionAwareAnalyzer(config)
 
     rows = []
-    for i, row in enumerate(items, start=1):
+    progress = _progress(items, "evaluating")
+    for i, row in enumerate(progress, start=1):
         with Image.open(data_dir / row["image"]) as handle:
             image = handle.convert("RGB")
 
@@ -262,7 +299,14 @@ def main():
             record["localisation"] = mask_metrics(pred, truth)
 
         rows.append(record)
+
+        # Live running numbers, not just a spinner: a long evaluation whose
+        # AUC is already visibly wrong should be killable at image 40 rather
+        # than at image 360.
+        _update_progress(progress, rows)
         if i % 10 == 0 or i == len(items):
+            # Also written as plain lines, so a redirected log stays greppable
+            # (tqdm draws to stderr and rewrites one line).
             print(f"[{i}/{len(items)}] {row['class']:9s} {report.verdict.verdict:24s} "
                   f"score={report.score:.3f} regions={len(report.verdict.findings)} {seconds:.1f}s",
                   flush=True)
