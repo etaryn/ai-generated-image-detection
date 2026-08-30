@@ -75,22 +75,33 @@ mapper:
   # rather than trusted.
   min_support: 0.15
 
-  # Fitted calibrators, one per scale (scripts/calibrate_mapper.py). Set this to
-  # null to run uncalibrated, in which case the thresholds are nominal and
-  # fusion caps reported confidence at 0.60 and says so in the explanation.
+  # Fitted calibrators, one per scale (scripts/calibrate_mapper.py).
   #
-  # The shipped file was fitted on SID-Set validation shard 1 -- deliberately a
-  # different shard from the one eval/ scores against -- with tampered patches
-  # labelled by whether their centre falls inside the tamper mask. Held-out ECE:
+  # DEFAULT IS null -- uncalibrated -- and that is a measured decision, not an
+  # oversight. configs/calibration_sdxl_detector.json exists, is fitted
+  # correctly, and improves held-out ECE substantially (64px 0.234 -> 0.089,
+  # 128px 0.221 -> 0.080, 224px 0.191 -> 0.071). It still makes the *system*
+  # worse. Measured on 360 SID-Set images, calibrated vs uncalibrated:
   #
-  #     64px   0.234 -> 0.089
-  #     128px  0.221 -> 0.080
-  #     224px  0.191 -> 0.071
+  #     AUC real vs tampered      0.589 -> 0.539
+  #     localisation mean IoU     0.074 -> 0.039
+  #     localisation touch rate   0.533 -> 0.225
+  #     any region on tampered    0.858 -> 0.558
+  #     real images with a region 0.825 -> 0.483   (the intended effect)
   #
-  # It is valid ONLY for hf:Organika/sdxl-detector at scales [64, 128, 224].
-  # Change either and refit, or set this to null; a calibrator carried across
-  # backends is worse than none.
-  calibration_path: configs/calibration_sdxl_detector.json
+  # Why: calibration discounts the 64px scale, which was producing most of the
+  # false regions -- and most of the true ones. The false positives and the
+  # localisation signal come from the same source, so a monotone rescaling
+  # cannot separate them. The scores were not really miscalibrated; a 64px crop
+  # of a real photo and a 64px crop of a generated region genuinely look alike
+  # to a detector trained on whole images. That is an information problem, and
+  # only a patch-scale-trained backend fixes it (see EVALUATION.md, "the known
+  # ceiling").
+  #
+  # Keep this null for the Hub backends. Refit and enable it if you train a
+  # patch-scale detector, where the premise may hold. A calibrator is valid only
+  # for the backend and scales it was fitted on.
+  calibration_path: null
 
 regions:
   min_area_frac: 0.004    # below this a component is patch jitter, not an object
