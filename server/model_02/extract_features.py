@@ -47,10 +47,18 @@ from features.pipeline import FeatureStack
 from shared import RobustnessAugment
 
 
-def resolve_dataset_roots(cfg: dict, names: list[str] | None = None) -> list[Path]:
-    data_root = Path(cfg["data"]["data_root"])
+def resolve_dataset_roots(cfg: dict, names: list[str] | None = None,
+                          data_root: str | Path | None = None) -> list[Path]:
+    """Dataset directories to read, as `<data_root>/<name>`.
+
+    `data_root` overrides the config's, mirroring model_01's `train.py --data_root`.
+    The SLURM scripts use it to point at a copy of the dataset unpacked onto the
+    compute node's local disk: $HOME is inode-quota'd on this cluster and reading
+    tens of thousands of small files back over NFS is the slow part of extraction.
+    """
+    root = Path(data_root) if data_root else Path(cfg["data"]["data_root"])
     names = names if names is not None else cfg["data"]["train_datasets"]
-    return [data_root / name for name in names]
+    return [root / name for name in names]
 
 
 def demo_eval_samples(cfg: dict) -> list[tuple[Path, int]]:
@@ -135,6 +143,9 @@ def main():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--out", default=None, help="Output .npz (defaults to the config's cache path)")
     parser.add_argument("--datasets", nargs="*", default=None, help="Override data.train_datasets")
+    parser.add_argument("--data-root", default=None,
+                        help="Override data.data_root (e.g. a node-local copy of the "
+                             "dataset; see model_01/train.py --data_root)")
     parser.add_argument("--demo-eval-set", action="store_true", help="Extract the held-out demo set instead")
     parser.add_argument("--aug-copies", type=int, default=None, help="Override features.train_aug_copies")
     parser.add_argument(
@@ -165,7 +176,9 @@ def main():
     if args.demo_eval_set:
         samples = demo_eval_samples(cfg)
     else:
-        samples = build_labeled_samples(resolve_dataset_roots(cfg, args.datasets))
+        samples = build_labeled_samples(
+            resolve_dataset_roots(cfg, args.datasets, args.data_root)
+        )
 
     if args.limit is not None:
         rng = random.Random(seed)

@@ -1,0 +1,178 @@
+# model_02 on full-resolution, multi-generator data.
+#
+# configs/default.yaml trains on CIFAKE: 32x32, one Stable-Diffusion family. It
+# measures the pipeline, not the problem -- the challenge is cross-generator
+# transfer, and CIFAKE contains exactly one generator at a resolution where the
+# FFT branch has no genuine high-frequency band to read.
+#
+# This config trains on three families prepared by `prepare_generators.py`:
+#
+#   gen_progan       ProGAN (ForenSynths)   vs LSUN          256x256 native, matched pairs
+#   gen_midjourney   MidJourney (GenImage)  vs Open Images   1024px sources
+#   gen_dalle3       DALL-E 3               vs Open Images   1024px sources
+#
+# Every image on disk is already a native-resolution 256x256 center crop with the
+# JPEG grid phase preserved and one uniform JPEG re-encode applied to both classes.
+# That is not incidental: see prepare_generators.py's module docstring for the two
+# confounds (resolution and compression history) that make the naive version of
+# this dataset separable at AUC>0.95 on a single trivial scalar.
+#
+# How to run it
+# -------------
+# Extract ONE cache per family, then combine caches at train time. Extraction is
+# the expensive step, so this pays for itself the moment you run more than one fold:
+#
+#   python extract_features.py --config configs/generators.yaml \
+#       --datasets gen_progan     --out features/cache/gen_progan.npz
+#   python extract_features.py --config configs/generators.yaml \
+#       --datasets gen_midjourney --out features/cache/gen_midjourney.npz
+#   python extract_features.py --config configs/generators.yaml \
+#       --datasets gen_dalle3     --out features/cache/gen_dalle3.npz
+#
+#   # in-distribution: all three families, grouped val split
+#   python train.py --config configs/generators.yaml \
+#       --cache features/cache/gen_{progan,midjourney,dalle3}.npz
+#
+#   # leave-one-generator-out: the number that actually matters
+#   python train.py --config configs/generators.yaml \
+#       --cache features/cache/gen_{progan,midjourney}.npz \
+#       --out checkpoints/loo_dalle3.pt
+#
+# The held-out family is then scored with infer.py or eval/robustness_eval.py. A
+# large in-distribution/held-out gap is the honest finding here, not a failure --
+# it is the quantity CIFAKE could never report.
+
+data:
+  data_root: "../../data/raw"
+  train_datasets: ["gen_progan", "gen_midjourney", "gen_dalle3"]
+  val_split: 0.1                 # held out from train_datasets, split BY SOURCE IMAGE
+
+  # Must stay 256, matching prepare_generators.py's --crop-size. When the two
+  # agree, `data_io.CanonicalCrop` is an exact no-op on this data and no pixel is
+  # ever resampled between disk and the extractors. Change one and you must
+  # change the other, or the FFT branch starts reading our own interpolation.
+  canonical_size: 256
+
+  batch_size: 64
+  num_workers: 8
+
+  # Demonstration-only, never trained on. The real half is COCO val2017, which is
+  # why prepare_generators.py pairs its fakes with Open Images rather than COCO --
+  # bitmind/MS-COCO is COCO-2014 under Karpathy splits and overlaps val2017 by
+  # image id, which would quietly contaminate this holdout.
+  demo_eval_set:
+    real_dir: "../../data/raw/wildfake_demo/coco_val2017"
+    fake_dir: "../../data/raw/wildfake_demo/dalle_advanced"
+
+augmentation:
+  # Unchanged from default.yaml: the same transform family model_01 uses, applied
+  # through model_01's RobustnessAugment via shared.py so both models train
+  # against identical redistribution.
+  jpeg:
+    prob: 0.5
+    qualities: [90, 70, 50, 30]
+  gaussian_blur:
+    prob: 0.4
+    sigmas: [0.5, 1.0, 2.0]
+  resize_roundtrip:
+    prob: 0.4
+    scales: [0.5, 0.25]
+  gaussian_noise:
+    prob: 0.4
+    sigmas: [0.02, 0.05, 0.10]
+  color_jitter:
+    prob: 0.4
+    max_delta: 0.20
+  center_crop:
+    prob: 0.3
+    crop_fraction: 0.80
+
+features:
+  cache_dir: "features/cache"
+  # Only used when --out is omitted. The documented workflow above writes one
+  # cache per family instead, so folds are recombinations rather than re-extractions.
+  cache_name: "train_generators.npz"
+
+  train_aug_copies: 1
+
+  dinov2:
+    enabled: true
+    model_name: "facebook/dinov2-base"
+    image_size: 224
+    pooling: "cls_mean"
+    l2_normalize: true
+
+  clip:
+    enabled: true
+    # "-quickgelu", not plain "ViT-B-16". OpenAI's CLIP weights were trained with
+    # QuickGELU, and since open_clip 2.24 the plain "ViT-B-16" entry builds the
+    # model with standard nn.GELU. Pairing it with pretrained="openai" loads the
+    # weights into the wrong activation and open_clip emits:
+    #   "QuickGELU mismatch between final model config (quick_gelu=False) and
+    #    pretrained tag 'openai' (quick_gelu=True)"
+    # The model still runs, so this degrades the 512 CLIP dims silently rather
+    # than failing. That matters most here: frozen CLIP features are the strongest
+    # known baseline for cross-generator transfer, which is the whole point of
+    # this config. configs/default.yaml still says "ViT-B-16" and so carries the
+    # same defect -- left alone deliberately, so the existing CIFAKE checkpoint
+    # stays reproducible; change it there together with a re-extraction.
+    backbone_name: "ViT-B-16-quickgelu"
+    pretrained: "openai"
+    image_size: 224
+    l2_normalize: true
+
+  fft:
+    # This is the branch the whole data-preparation protocol exists to protect,
+    # and the first time it gets a fair test: at 256px native these crops have a
+    # genuine high-frequency band, which upsampled 32px CIFAKE never did.
+    enabled: true
+    work_size: 256
+    n_radial_bins: 32
+    n_angular_bins: 16
+    blur_sigma: 1.0
+    n_threads: 4
+
+classifier:
+  type: "mlp"
+
+  mlp:
+    hidden_dims: [512, 128]
+    dropout: 0.3
+    epochs: 40
+    batch_size: 256
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    early_stopping_patience: 8
+
+  xgboost:
+    n_estimators: 800
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1.0
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+    tree_method: "hist"
+    verbose_eval: 50
+
+train:
+  checkpoint_dir: "checkpoints/"
+  seed: 42
+
+eval:
+  threshold: 0.5
+  target_fpr: 0.05
+  severities:
+    - "clean"
+    - "jpeg_q70"
+    - "jpeg_q30"
+    - "blur_s1.0"
+    - "resize_0.5x"
+    - "resize_0.25x"
+    - "noise_s0.05"
+    - "color_jitter_20pct"
+    - "center_crop_80pct"
+    - "compound_moderate"
+    - "compound_severe"
+  output_dir: "eval/outputs/"

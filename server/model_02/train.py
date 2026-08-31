@@ -51,6 +51,57 @@ def load_cache(path: str | Path) -> dict:
     }
 
 
+def load_caches(paths: list[str | Path]) -> dict:
+    """Load one or more caches and concatenate them into a single training set.
+
+    This is what makes leave-one-generator-out affordable. Extraction is the
+    expensive step (two ViT passes per image), so each generator family is
+    extracted exactly once into its own cache; the folds are then just different
+    combinations of those caches, costing nothing but a concatenate. Merging at
+    extraction time instead would re-encode every image once per fold.
+
+    Group ids are offset per cache before stacking. They are only unique within
+    the cache that produced them, so stacking raw ids would fuse unrelated source
+    images into one group and hand `group_split` a corrupted split -- the exact
+    near-duplicate leakage the grouping exists to prevent.
+    """
+    caches = [load_cache(p) for p in paths]
+    if len(caches) == 1:
+        return caches[0]
+
+    dims = {c["X"].shape[1] for c in caches}
+    if len(dims) > 1:
+        raise ValueError(
+            f"Caches have different feature widths {sorted(dims)}; they were built "
+            f"with different feature configs and cannot be combined. Re-extract "
+            f"them with the same config."
+        )
+    blocks = {json.dumps(c["meta"]["features"]["blocks"], sort_keys=True) for c in caches}
+    if len(blocks) > 1:
+        raise ValueError(
+            "Caches have different block layouts; re-extract them with the same "
+            "features config so their columns line up."
+        )
+
+    offset = 0
+    groups = []
+    for c in caches:
+        groups.append(c["groups"] + offset)
+        offset += int(c["groups"].max()) + 1
+
+    merged = {
+        "X": np.vstack([c["X"] for c in caches]),
+        "y": np.concatenate([c["y"] for c in caches]),
+        "groups": np.concatenate(groups),
+        "paths": np.concatenate([c["paths"] for c in caches]),
+        "aug_flags": np.concatenate([c["aug_flags"] for c in caches]),
+        "meta": caches[0]["meta"],
+    }
+    print(f"  merged {len(caches)} caches -> X{merged['X'].shape} "
+          f"({int((merged['y'] == 0).sum())} real / {int((merged['y'] == 1).sum())} fake)")
+    return merged
+
+
 def group_split(groups: np.ndarray, val_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     """Split rows by source image, not by row.
 
@@ -119,7 +170,11 @@ def train_classifier(cfg: dict, classifier_type: str, X_tr, y_tr, X_va, y_va, fe
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--cache", default=None, help="Feature cache .npz (defaults to the config's path)")
+    parser.add_argument("--cache", nargs="+", default=None,
+                        help="One or more feature cache .npz files (defaults to the "
+                             "config's path). Several are concatenated into one training "
+                             "set, which is how leave-one-generator-out folds are built "
+                             "without re-extracting features per fold.")
     parser.add_argument("--classifier", default=None, choices=["mlp", "xgboost"], help="Override classifier.type")
     parser.add_argument(
         "--blocks",
@@ -138,8 +193,8 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    cache_path = args.cache or str(Path(cfg["features"]["cache_dir"]) / cfg["features"]["cache_name"])
-    cache = load_cache(cache_path)
+    cache_paths = args.cache or [str(Path(cfg["features"]["cache_dir"]) / cfg["features"]["cache_name"])]
+    cache = load_caches(cache_paths)
     X, y, groups = cache["X"], cache["y"], cache["groups"]
     block_spec = cache["meta"]["features"]["blocks"]
     feature_names = cache["meta"]["feature_names"]
@@ -154,7 +209,7 @@ def main():
 
     classifier_type = args.classifier or cfg["classifier"]["type"]
     print(
-        f"cache: {cache_path}\n"
+        f"cache: {', '.join(str(c) for c in cache_paths)}\n"
         f"rows: {len(X)} ({len(train_idx)} train / {len(val_idx)} val, split by source image)\n"
         f"features: {X.shape[1]} in blocks " + ", ".join(f"{b['name']}({b['dim']})" for b in block_spec) + "\n"
         f"classifier: {classifier_type}"
@@ -189,7 +244,7 @@ def main():
         # (--blocks fft) stays runnable without a second, differently-shaped cache.
         "feature_columns": col_idx.tolist(),
         "config": cfg,
-        "cache_path": str(cache_path),
+        "cache_paths": [str(c) for c in cache_paths],
         "val_metrics": metrics,
         "threshold": cfg["eval"]["threshold"],
         "calibrated_threshold": {"target_fpr": fpr_budget, "threshold": calibrated},

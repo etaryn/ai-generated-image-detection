@@ -28,6 +28,30 @@ from pathlib import Path
 RAW_DIR = Path("data/raw")
 
 INSTRUCTIONS = {
+    "generators": """
+Multi-generator, full-resolution data (DALL-E 3 / MidJourney / ProGAN).
+
+This one IS automated -- see server/model_02/prepare_generators.py:
+
+    sbatch prepare_generators.sbatch        # from the repo root
+    # or, off the login node:
+    python server/model_02/prepare_generators.py --families all --per-class 5000
+
+It writes three paired datasets in the usual layout, and both models can train on
+them (model_01 would need its 224px stem schedule; see configs/default.yaml):
+
+    data/raw/gen_progan/{real,fake}/        ProGAN vs LSUN      (ForenSynths, matched pairs)
+    data/raw/gen_midjourney/{real,fake}/    MidJourney vs Open Images
+    data/raw/gen_dalle3/{real,fake}/        DALL-E 3 vs Open Images
+
+Do NOT run it on the login node: `ulimit -v` is 1GB there and both the Hugging
+Face transfer backend and pyarrow blow through that immediately.
+
+Every image is a native-resolution center crop, never a resize, with one uniform
+JPEG re-encode across both classes. Both of those exist to kill shortcuts that
+otherwise make the data separable at AUC>0.95 without any generator signal --
+server/model_02/README.md has the measurements.
+""",
     "sid_set": """
 SID_Set (Hugging Face): https://huggingface.co/datasets/saberzl/SID_Set
 

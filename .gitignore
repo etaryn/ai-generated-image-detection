@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-data/
+.tmp/
 .env
 data/raw/
 data/cache/
@@ -16,3 +18,4 @@ eval/*.png
 .DS_Store
 .ipynb_checkpoints/
 slurm_logs/
+logs/

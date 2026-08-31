@@ -9,7 +9,12 @@ resolution). So the loader here produces one *canonical* representation --
     float32 tensor, shape (3, S, S), values in [0, 1], no normalization --
 
 and each extractor derives what it needs from that (see features/base.py). One
-decode + resize per image, shared by all three branches.
+decode + canonicalization per image, shared by all three branches.
+
+Canonicalization is a native-resolution center crop wherever the image is large
+enough (see `CanonicalCrop`), falling back to a resize only for inputs smaller
+than `canonical_size`. Rescaling writes directly into the frequency band the FFT
+branch reads, so it is avoided wherever it can be.
 
 The optional `pil_transform` slot is where the challenge's redistribution
 transforms go: `RobustnessAugment` (random, for building an augmented training
@@ -31,9 +36,57 @@ from torchvision import transforms as T
 from shared import IMAGE_EXTENSIONS, RealFakeImageDataset, apply_named_transform
 
 
+class CanonicalCrop:
+    """PIL -> canonical `size`x`size` PIL image, preferring a native-resolution crop.
+
+    Cropping is preferred over resizing because `features/fft.py` reads the noise
+    floor, and rescaling *writes* to exactly that band: an upscale manufactures
+    high frequencies by interpolation and a downscale destroys them. Either way
+    the spectral columns end up describing our own preprocessing rather than the
+    generator, which is the failure the top-level README documents for upsampled
+    CIFAKE.
+
+    `prepare_generators.py` already writes training data as native-resolution
+    center crops at this size, so training sees no rescaling at all. Inference
+    has to cope with whatever resolution a caller hands it, and the two must
+    agree -- a model trained on native crops but served resized uploads is a
+    train/serve mismatch precisely in the band it relies on. So:
+
+      - larger than `size` on both sides -> center crop at native resolution,
+        offset snapped to a multiple of 8 to preserve JPEG grid phase (64 of the
+        FFT block's 130 columns are a block-DCT profile keyed to that grid);
+      - smaller on either side -> resize the short side up, then crop. This is
+        the lossy path and it is unavoidable for small inputs, but it is now the
+        exception rather than the rule.
+
+    32x32 CIFAKE always takes the resize path, so existing CIFAKE caches keep
+    their previous behaviour.
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if min(w, h) < self.size:
+            scale = self.size / min(w, h)
+            # BILINEAR, matching torchvision's T.Resize default, so the small-image
+            # path is byte-identical to the previous behaviour and existing CIFAKE
+            # caches and checkpoints stay valid. PIL's resize is antialiased on
+            # downscale, which the README requires for the same spectral reason.
+            img = img.resize(
+                (max(self.size, round(w * scale)), max(self.size, round(h * scale))),
+                Image.BILINEAR,
+            )
+            w, h = img.size
+        left = ((w - self.size) // 2) & ~7
+        top = ((h - self.size) // 2) & ~7
+        return img.crop((left, top, left + self.size, top + self.size))
+
+
 def canonical_transform(canonical_size: int):
     """PIL -> (3, S, S) float tensor in [0, 1]."""
-    return T.Compose([T.Resize((canonical_size, canonical_size)), T.ToTensor()])
+    return T.Compose([CanonicalCrop(canonical_size), T.ToTensor()])
 
 
 class NamedSeverity:
