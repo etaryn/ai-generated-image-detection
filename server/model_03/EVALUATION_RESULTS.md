@@ -201,6 +201,153 @@ the flat confidence — not the ordering of individual rows. Note that jpeg q60
 (0.462) scoring worse than the harsher q30 (0.564) is almost certainly sampling
 noise rather than a real effect.
 
+## 7. Does the trained patch scorer's localisation gain survive degradation?
+
+§1 and its held-out repeat (`eval_results/heldout_tables_*.md`) show the
+patch-trained backend amplifies the localisation thesis on clean data — mean
+IoU **0.433–0.509** against the base backend's **0.049–0.074**, and a bigger
+AUC(tampered) gain from turning localisation on (+0.211 / +0.206 vs +0.079 /
++0.085). That is the correct comparison for the thesis (same backend, same
+images, localisation on vs off) but it had only ever been run on clean data.
+`eval/robustness.py` originally reported only the fused (with-localisation)
+score per condition; it now also records `whole_image_score` — the same
+whole-image number `fuse()` always computes internally as one of its two
+inputs, so no extra backend calls — which reproduces §1's with/without pairing
+per degradation condition instead of once on clean data. Run on shard 3,
+untouched by any other measurement here, both backends paired on the same 45
+images (15/class) at 768px, uncalibrated:
+
+```bash
+python eval/fetch_sid_set.py --split validation --shard 3 --per_class 15 --out <shard3>
+python eval/robustness.py --data_dir <shard3> --backend hf:Organika/sdxl-detector \
+    --limit 15 --max_side 768 --out eval_results/robustness_base.json
+python eval/robustness.py --data_dir <shard3> --backend checkpoints/patch_scorer \
+    --limit 15 --max_side 768 --out eval_results/robustness_patch_scorer.json
+```
+
+### 7a. The headline comparison: plain baseline vs the full upgrade
+
+The question that matters to a user of the system: does swapping in the
+trained patch scorer *and* turning localisation on (the shipped configuration)
+beat the original plain whole-image baseline (no localisation, the public
+`Organika/sdxl-detector`, scored once)?
+
+| Condition | baseline: base backend, no localisation | shipped: patch scorer + localisation | delta |
+|---|---|---|---|
+| clean | 0.467 | **0.756** | +0.289 |
+| jpeg q90 | 0.436 | **0.867** | +0.431 |
+| jpeg q60 | 0.311 | 0.342 | +0.031 |
+| jpeg q30 | 0.418 | 0.422 | +0.004 |
+| blur σ0.5 | 0.453 | **0.778** | +0.324 |
+| blur σ1.0 | 0.449 | 0.489 | +0.040 |
+| blur σ2.0 | 0.440 | **0.627** | +0.187 |
+| downscale ×0.5 | 0.449 | 0.480 | +0.031 |
+| downscale ×0.25 | 0.436 | 0.342 | **−0.093** |
+| noise σ0.02 | 0.467 | **0.853** | +0.387 |
+| noise σ0.05 | 0.462 | **0.729** | +0.267 |
+| crop 0.9 | 0.444 | **0.764** | +0.320 |
+| crop 0.8 | 0.444 | **0.762** | +0.318 |
+| saturate ×1.5 | 0.449 | **0.836** | +0.387 |
+
+The shipped configuration beats the plain baseline at **13 of 14 conditions**,
+often by a wide margin. **downscale ×0.25 is the one loss** — the only
+condition anywhere in this document where the fully upgraded system is worse
+than the original whole-image baseline it replaced.
+
+### 7b. Isolating the localisation effect itself, per backend and per condition
+
+The table above bundles two changes together (backend *and* localisation).
+Unbundling them — with vs without localisation, same backend, same images,
+same condition — is what actually tests the thesis:
+
+**Base backend** (`AUC(tampered)`, with localisation → without):
+
+| Condition | with | without | delta |
+|---|---|---|---|
+| clean | 0.444 | 0.467 | −0.022 |
+| jpeg q90 | 0.453 | 0.436 | +0.018 |
+| jpeg q60 | 0.289 | 0.311 | −0.022 |
+| jpeg q30 | 0.413 | 0.418 | −0.004 |
+| blur σ0.5 | 0.462 | 0.453 | +0.009 |
+| blur σ1.0 | 0.449 | 0.449 | +0.000 |
+| **blur σ2.0** | **0.693** | 0.440 | **+0.253** |
+| downscale ×0.5 | 0.400 | 0.449 | −0.049 |
+| **downscale ×0.25** | **0.604** | 0.436 | **+0.169** |
+| noise σ0.02 | 0.422 | 0.467 | −0.044 |
+| noise σ0.05 | 0.462 | 0.462 | +0.000 |
+| crop 0.9 | 0.484 | 0.444 | +0.040 |
+| crop 0.8 | 0.516 | 0.444 | +0.071 |
+| saturate ×1.5 | 0.347 | 0.449 | −0.102 |
+
+**Patch scorer** (`AUC(tampered)`, with localisation → without):
+
+| Condition | with | without | delta |
+|---|---|---|---|
+| clean | 0.756 | 0.711 | +0.044 |
+| jpeg q90 | 0.867 | 0.716 | +0.151 |
+| **jpeg q60** | 0.342 | **0.564** | **−0.222** |
+| **jpeg q30** | 0.422 | **0.609** | **−0.187** |
+| blur σ0.5 | 0.778 | 0.711 | +0.067 |
+| **blur σ1.0** | 0.489 | **0.684** | **−0.196** |
+| blur σ2.0 | 0.627 | 0.667 | −0.040 |
+| **downscale ×0.5** | 0.480 | **0.702** | **−0.222** |
+| **downscale ×0.25** | 0.342 | **0.667** | **−0.324** |
+| noise σ0.02 | 0.853 | 0.711 | +0.142 |
+| noise σ0.05 | 0.729 | 0.729 | +0.000 |
+| crop 0.9 | 0.764 | 0.733 | +0.031 |
+| crop 0.8 | 0.762 | 0.744 | +0.018 |
+| saturate ×1.5 | 0.836 | 0.724 | +0.111 |
+
+(Full per-condition detail, including AUC(all), IoU, confidence and verdict
+stability, is in `eval_results/robustness_base.json` /
+`robustness_patch_scorer.json`.)
+
+Two things follow from unbundling it this way, and both revise the earlier
+version of this section, which inferred the localisation effect from an IoU
+proxy rather than measuring it directly per condition:
+
+**For the base backend**, localisation is mostly noise at this sample size
+(deltas within ±0.05, matching §6's ±0.09 standard error) except two large,
+genuine wins — **blur σ2.0 (+0.253) and downscale ×0.25 (+0.169)** — where the
+region map recovers detection the whole-image score had lost.
+
+**For the patch scorer**, the effect is far larger in both directions, and it
+is *net negative* at five conditions, not the three this section originally
+reported: **jpeg q60 (−0.222), jpeg q30 (−0.187), blur σ1.0 (−0.196),
+downscale ×0.5 (−0.222) and downscale ×0.25 (−0.324)** — the last of these
+large enough that it is also why the patch scorer loses to the plain baseline
+in §7a. In every one of these five, `eval_results/robustness_patch_scorer.json`
+shows recall and IoU at or above their clean-condition level (recall peaks at
+**0.939** at jpeg q30) — the map keeps finding the right pixels; fusing that
+finding into the score makes the decision *worse* than trusting the whole-image
+number alone. This is the same "excellent within-image ranking, wrong absolute
+level" failure already recorded in the patch-scorer training run above
+(per-pixel map AUC 0.460→0.955, partially-AI subset AUC 0.648→**0.604**) —
+independent confirmation that it recurs specifically under heavy JPEG,
+moderate blur and downscaling, not an artefact of that one run.
+
+Where the patch scorer's localisation *does* help, it helps by more than the
+base backend ever does (up to +0.151 at jpeg q90, +0.142 at noise σ0.02) — the
+training clearly sharpened the map. It just did not sharpen it *uniformly*:
+the same training that produced a much more confident, much more accurate map
+on clean and mildly-degraded images produced one that actively misleads fusion
+on exactly the transforms (heavy JPEG, moderate-to-heavy downscale, moderate
+blur) that most directly attack patch-level statistics.
+
+At **noise σ0.05**, both backends show delta = 0.000 exactly — regions per
+image collapse to near zero for both (0.04 and 0.09, from §6/§7's raw JSON),
+so there is no local evidence for fusion to add or subtract. Whatever
+detection the patch scorer has left there is the classifier itself, not
+localisation.
+
+**Caveat:** n=15/class, the same ±0.09 AUC standard error as §6. Several of
+the individually large within-backend deltas above (base backend's blur σ2.0
+and downscale ×0.25 especially) are plausible but not independently
+significance-tested at this sample size — treat the *pattern* (patch-scorer
+localisation is unreliable under JPEG/blur/downscale specifically) as the
+finding, not the exact magnitude of any one row. Confirming it needs the same
+fix as everywhere else in this document: more images per condition.
+
 ---
 
 ## What to do next, in order of expected value

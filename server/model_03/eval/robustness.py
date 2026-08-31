@@ -158,6 +158,11 @@ def main():
                 "stem": stem,
                 "class": row["class"],
                 "score": float(report.score),
+                # fuse() computes this unconditionally as one whole-image backend
+                # call, whether or not any region fires -- so recording it costs
+                # nothing extra and gives the with/without-localisation pairing
+                # eval/ablation.py does on clean data, per condition here too.
+                "whole_image_score": float(report.verdict.details["whole_image_score"]),
                 "verdict": report.verdict.verdict,
                 "confidence": float(report.verdict.confidence),
                 "n_regions": len(report.verdict.findings),
@@ -181,10 +186,19 @@ def main():
         synthetic = np.array([r["score"] for r in rows if r["class"] == "synthetic"])
         loc = [r["localisation"] for r in rows if "localisation" in r]
 
+        whole_real = np.array([r["whole_image_score"] for r in rows if r["class"] == "real"])
+        whole_tampered = np.array([r["whole_image_score"] for r in rows if r["class"] == "tampered"])
+        whole_synthetic = np.array([r["whole_image_score"] for r in rows if r["class"] == "synthetic"])
+
         results[cond_name] = {
             "severity": severity,
             "auc_real_vs_all_ai": auc(np.concatenate([tampered, synthetic]), real),
             "auc_real_vs_tampered": auc(tampered, real),
+            # "without localisation" arm: the same backend, same image, scored once
+            # as a whole -- exactly what eval/ablation.py compares on clean data,
+            # here per degradation condition.
+            "auc_real_vs_all_ai_whole_image": auc(np.concatenate([whole_tampered, whole_synthetic]), whole_real),
+            "auc_real_vs_tampered_whole_image": auc(whole_tampered, whole_real),
             "mean_confidence": float(np.mean([r["confidence"] for r in rows])),
             "verdict_stability_vs_clean": float(
                 np.mean([r["verdict"] == clean_verdicts.get(r["stem"]) for r in rows])
@@ -198,6 +212,7 @@ def main():
         print(
             f"{cond_name:16s} AUC(all)={r['auc_real_vs_all_ai']:.3f} "
             f"AUC(tamp)={r['auc_real_vs_tampered']:.3f} "
+            f"[no-loc AUC(tamp)={r['auc_real_vs_tampered_whole_image']:.3f}] "
             f"conf={r['mean_confidence']:.2f} "
             f"stable={r['verdict_stability_vs_clean']:.2f} "
             f"loc_recall={(r['mean_localisation_recall'] or 0):.3f}",
