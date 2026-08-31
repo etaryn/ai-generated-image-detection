@@ -3,7 +3,7 @@
 model_03 has two very different kinds of check, and conflating them is how a
 prototype ends up sounding validated when it isn't:
 
-- **`tests/`** — 79 unit tests. They answer *does the machinery do what it says?*
+- **`tests/`** — 101 unit tests. They answer *does the machinery do what it says?*
   They run against a stub scorer, need no network and no GPU, and finish in
   seconds. They cannot tell you whether the maps land on real edits.
 - **`eval/`** — this document. It answers *is it actually right?*, against
@@ -35,21 +35,30 @@ whole-image score averages a small AI region into invisibility.
 diagnostics that explain behaviour. They are not success criteria. The only
 metric that decides anything is AUC(real vs AI).
 
-| # | Condition | Target | Base model |
-|---|---|---|---|
-| 1 | AUC(real vs AI), clean | ≥ 0.90 | 0.739 |
-| 2 | AUC(real vs AI), worst degradation | ≥ 0.85 | 0.674 |
-| 3 | AUC on the **partially-AI** subset | ≥ 0.80 | 0.589 |
-| 4 | FPR on real images at 80% recall | ≤ 0.10 | 0.492 |
-| 5 | Region-aware beats whole-image on all AI | significant | +0.018, n.s. |
+| # | Condition | Target | Base model | Patch scorer | + confidence gate |
+|---|---|---|---|---|---|
+| 1 | AUC(real vs AI), clean | ≥ 0.90 | 0.739 | **0.921** ✓ | **0.926** ✓ |
+| 2 | AUC(real vs AI), worst degradation | ≥ 0.85 | 0.674 | 0.473 ✗ | 0.836 |
+| 3 | AUC on the **partially-AI** subset, clean | ≥ 0.80 | 0.589 | **0.847** ✓ | **0.856** ✓ |
+| 4 | FPR on real images at 80% recall, clean | ≤ 0.10 | 0.492 | **0.080** ✓ | **0.040** ✓ |
+| 5 | Region-aware beats whole-image on all AI | significant | +0.018, n.s. | **+0.090** [+0.028, +0.153] | — |
 
-Condition 5 is the project's thesis. Condition 3 is where it is actually lost:
-a whole-image detector scores **0.508 — chance — on partially-AI images**, which
-is the gap the region machinery exists to close.
+Condition 5 is the project's thesis. Base-model columns are the 2026-08-30
+shard-0 run; the last two are held-out shard 3 at 50/class, 768px
+(`EVALUATION_RESULTS.md` §8–§10). Conditions 1, 3, 4 and 5 are met by the
+trained patch scorer; **condition 2 is the one still open**, and it is now the
+only one.
 
-Measured across the 14 degradation conditions, AUC(real vs AI) stays in
-0.674–0.802 against 0.782 clean. **Degradation is not currently the binding
-constraint. Partially-AI images are.**
+The reason is worth stating precisely, because it inverted since the base model.
+For the base model, degradation was not the binding constraint — AUC stayed in
+0.674–0.802 across 14 conditions and partially-AI images were the whole problem.
+The patch scorer fixed partially-AI images and *created* a degradation problem:
+under heavy JPEG and downscaling its map fires confidently on degraded
+**authentic** photographs, and fusing that map drives the decision below chance
+(0.376 at jpeg q30 against the same backend's whole-image 0.598). Gating on the
+pipeline's own pre-cap confidence recovers most of it — worst condition 0.376 →
+0.687 on the partially-AI subset, 0.473 → 0.836 on all AI — which is what the
+last column reports, and why it is a gate rather than a better map.
 
 ## The primary experiment: does the idea work?
 
@@ -178,6 +187,39 @@ python eval/evaluate.py --backend haywoodsloan/ai-image-detector-deploy \
 # 7. regenerate the tables
 python eval/report.py eval_results/*.json \
     --robustness eval_results/robustness.json --out EVALUATION_RESULTS.md
+
+# 8. WHERE DOES IT BREAK, AND SHOULD THE MAP BE BELIEVED? Steps 5-7 tell you
+#    that a condition is bad; these tell you why and what to do about it.
+#    Every arm below reads the per-image rows eval/robustness.py now writes.
+
+#    8a. does re-placing the map's cuts fix a degradation, or is the patch
+#        signal simply gone? Run the same frames under each threshold mode.
+for mode in absolute quantile median_shift; do
+  python eval/robustness.py --data_dir eval_data/sid_set_val --limit 50 \
+      --backend checkpoints/patch_scorer --threshold_mode $mode \
+      --out eval_results/diag_ps_$mode.json
+done
+python eval/report_thresholds.py eval_results/diag_ps_*.json \
+    --out THRESHOLD_RESULTS.md
+
+#    8b. the gate: is the map trustworthy on THIS image? Replays the frozen
+#        rule offline, reports raw and rank-normalised gains, and --retune
+#        quantifies how optimistic a threshold fitted here would be.
+python eval/validate_gate.py eval_results/diag_ps_absolute.json --retune
+
+#    8c. the same gate through the real class, on a held-out shard. --dual
+#        wraps the pipeline in DualBackendAnalyzer; the threshold stays frozen.
+python eval/robustness.py --data_dir eval_data/sid_set_val_heldout --limit 50 \
+    --backend checkpoints/patch_scorer --dual --fallback_backend self \
+    --out eval_results/dual_self.json
+
+#    8d. only if the fallback is a SEPARATE model: put its scores on the
+#        primary's scale first, fitted on clean images, or the substitution
+#        moves the ranking for reasons unrelated to the image.
+python scripts/fit_score_alignment.py \
+    --primary eval_results/diag_ps_absolute.json \
+    --fallback eval_results/diag_base_absolute.json \
+    --out configs/score_alignment_patch_scorer_vs_sdxl.json
 ```
 
 `eval_data/` and `eval_results/` are gitignored — they are regenerable, and the
@@ -289,6 +331,42 @@ recovers at IoU 0.66 with scales `[64, 128, 224]` and IoU 0.17 with
 this floor — which is why `eval/evaluate.py` stratifies localisation by true
 edit size instead of reporting one average.
 
+### Degradation moves the map's scores, and it moves them on *real* images
+
+The region thresholds are absolute (0.45 / 0.75), so anything that shifts the
+map's score distribution changes how much of the frame fires without the content
+changing. Measured on shard 4 with the patch scorer, mean map median on
+**authentic** photographs: 0.022 clean → 0.120 at jpeg q60 → **0.382** at jpeg
+q30 → **0.683** at blur σ2.0, against tampered images that barely move
+(0.081 → 0.380 → 0.287). Real images with any region go 14% → 96%. Under noise
+the reverse: everything collapses to ~0.01 and the map switches off entirely.
+
+Two consequences, both measured rather than argued:
+
+- **This is the 64px-crop problem one level up.** A compressed or blurred
+  authentic photograph looks, patch by patch, like what a patch-scale detector
+  was trained to call generated. The fix is degradation-augmented hard negatives
+  in training, not anything downstream.
+- **Adaptive cuts do not rescue it.** `--threshold_mode quantile` and
+  `median_shift` (`mapper/heatmap.py`) both remove the shift and neither
+  recovers detection: mean AUC(tampered) 0.693 → 0.693 / 0.708, worst condition
+  0.368 → 0.372 / 0.378. `median_shift` *is* the better localiser (higher IoU in
+  11 of 14 conditions on two shards) at the cost of firing on 3× as many
+  authentic photographs, so it is an option, not the default.
+
+### Trusting the map per image beats trying to make it robust
+
+Since the map fails confidently rather than quietly, the productive question is
+whether the pipeline can tell when to ignore it. It can: gating on
+`confidence_uncapped` — the pre-cap confidence `fusion.py` now records — at
+0.8577 lifts mean AUC(tampered) across 14 degradation conditions from 0.692 to
+**0.803** and the worst condition from 0.376 to **0.687**, on a shard the
+threshold was not tuned on, with no measurable change on clean images
+(+0.009, CI [−0.063, +0.080]). `dual_backend.py` implements it; **but note the
+reported `confidence` cannot be used for this** — the uncalibrated cap saturates
+it at 0.60 on 98% of images. See `EVALUATION_RESULTS.md` §10 for the three ways
+this goes wrong if written as a bare `if`.
+
 ---
 
 ## Training a patch scorer (the server job)
@@ -366,19 +444,27 @@ Training fixed the easy half and lost ground on the hard half. **Getting the
 partially-AI subset up is the open problem**, and it is what more data plus hard
 negatives is expected to help with — verify it rather than assume it.
 
-## The known ceiling
+## The known ceiling — and what happened when it was lifted
 
-Every backend available is trained on **whole images**, and model_03 asks it
-about 64px crops. That mismatch is the largest single source of error in the
-system, and no amount of compute fixes it — the table above is what it looks
-like from the inside.
+Every *public* backend is trained on **whole images**, and model_03 asks it about
+64px crops. That mismatch was the largest single source of error in the system,
+and no amount of compute fixed it — the table above is what it looked like from
+the inside.
 
-The fix is a patch-scale detector, and SID-Set's **train** split (210k images,
-with masks) is public and sufficient to fine-tune one: sample patches, label
-them by mask membership, fine-tune a 224px backbone on that distribution, and
-register it as a backend. `mapper/backends.py` is written so that dropping one
-in means adding a class there and changing nothing else. That is the one item on
-this page where a stronger GPU pays for itself directly.
+The fix was a patch-scale detector, and it has since been built: SID-Set's
+**train** split (210k images, with masks) is public, `scripts/train_patch_scorer.py`
+samples patches, labels them by mask membership and fine-tunes a 224px backbone
+on that distribution, and `--backend checkpoints/patch_scorer` drops it in with
+no other change. On held-out shard 3 it takes AUC(real vs tampered) from 0.665 to
+0.847 and localisation IoU from 0.041 to 0.416.
+
+**It moved the ceiling rather than removing it.** The mismatch is now between a
+patch detector trained on clean patches and the degraded patches it meets in
+redistribution — see "Degradation moves the map's scores" above. The next
+training run should carry the degradations of `eval/robustness.py` into the
+augmentation pipeline and re-show the real-image patches that score highest under
+them; that is the direct fix for the one success condition still unmet, and the
+one item on this page where a stronger GPU pays for itself directly.
 
 ---
 
@@ -389,3 +475,11 @@ from a terminal drift from the runs that produced them. Each result file records
 the backend (model, device, `id2label`, which index was read as AI and how that
 was decided), the mapper config, and per-image rows — so a table can always be
 traced back to the run that made it.
+
+`eval/robustness.py` keeps the full per-image rows for every condition
+(`per_image` in its output), which is what makes the gate replayable offline:
+`eval/validate_gate.py`, `eval/report_thresholds.py` and
+`scripts/fit_score_alignment.py` all read those rows rather than costing another
+GPU hour. The other generators are `eval/report_robustness.py` (any class mix),
+`eval/report_cifake.py` (CIFAKE, carries the windowing-collapse caveat) and
+`eval/report_thresholds.py` (threshold modes and routing).

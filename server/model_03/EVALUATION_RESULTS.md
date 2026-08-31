@@ -1,8 +1,14 @@
 # Results — model_03 on SID-Set
 
-**Run:** 2026-08-30 · 360 images from SID-Set validation shard 0 (120 real / 120
-fully-synthetic / 120 tampered-with-mask) · backend
+**§1–§5 run:** 2026-08-30 · 360 images from SID-Set validation shard 0 (120 real
+/ 120 fully-synthetic / 120 tampered-with-mask) · backend
 `hf:Organika/sdxl-detector` · 1024px working resolution, scales [64, 128, 224].
+
+**§6–§7:** shard 3, 15/class, 768px, base backend vs the trained patch scorer.
+**§8–§10:** 2026-08-31 · shards 4 and 3 at 50/class, 768px, patch scorer — a
+fresh larger sample, a diagnosis of where it breaks, and the fix that came out
+of it. `TEST_LOG.md` is the chronological record of every run behind all of
+this, with job IDs.
 
 Regenerate everything below:
 
@@ -31,6 +37,32 @@ the gap model_03 was built to close. Region-aware analysis lifts that to
 But 0.589 is a weak detector, localisation IoU averages 0.074, and 82.5% of
 authentic photographs get flagged with at least one region. The idea is
 **directionally validated, not working**.
+
+### Where this stands, 2026-08-31
+
+That paragraph describes the **base** backend, which is what §1–§5 measure.
+Three things have changed it since, and each is documented below rather than
+folded back into the numbers above:
+
+1. **A patch-scale backend was trained** (`checkpoints/patch_scorer`), and it
+   moves the thesis a long way on clean data: on the same shard-4 frames,
+   AUC(real vs tampered) 0.587 → **0.854** and localisation IoU 0.041 →
+   **0.416** against the base backend (§8).
+2. **It is fragile in a specific, now-diagnosed way.** Under heavy JPEG,
+   moderate blur and downscaling the map keeps firing but stops meaning
+   anything, and fusing it *inverts* the decision — AUC(tampered) 0.376 at
+   jpeg_q30 against the whole-image score's 0.598 on the same images (§8, §9).
+3. **Deciding per image whether to believe the map recovers it** (§10). Gating
+   on the pipeline's own pre-cap confidence lifts mean AUC(tampered) across 14
+   conditions from 0.692 to **0.803** and the worst condition from 0.376 to
+   **0.687**, held out on a shard the gate was not tuned on, with no measurable
+   cost on clean images.
+
+The honest one-line state: **the system now works on clean and mildly degraded
+images and is held up under heavy degradation by a fallback, not by
+localisation.** Nothing here has been tested outside SID-Set at scale (CIFAKE
+is in `CIFAKE_RESULTS.md`, and localisation degenerates there — see
+`TEST_LOG.md` run 8).
 
 ---
 
@@ -175,7 +207,11 @@ expectation was that confidence would fall and verdicts would collapse toward
 - **Confidence is 0.60 in every single condition.** That is the uncalibrated cap
   (§4), which means the confidence signal carries *no information at all* right
   now. The mechanism designed to say "I can no longer tell" does not function.
-  Anything reading `confidence` today is reading a constant.
+  Anything reading `confidence` today is reading a constant. (**Revised by §9:**
+  the *reported* value is a constant, but the pre-cap value it is clamped from
+  is not, and gating on that pre-cap value is what §10 turns into the largest
+  robustness gain in this document. The cap was hiding a working signal, not
+  standing in for a missing one.)
 - **Under noise the system does not become unsure — it changes its mind.** At
   σ=0.05, only **9%** of images keep the verdict they had when clean, while AUC
   is essentially unchanged (0.764 vs 0.782). The ranking survives; the labels do
@@ -350,32 +386,259 @@ fix as everywhere else in this document: more images per condition.
 
 ---
 
+## 8. The same comparison on a fresh shard, at 3× the sample
+
+§6–§7 are 15 images per class, with an AUC standard error near ±0.09 — enough to
+establish a pattern, not a number. This repeats the identical protocol on SID-Set
+validation **shard 4** (untouched by any training, calibration or decision
+fitting) at **50 per class**, both backends, 14 conditions, 768px, uncalibrated.
+Full tables: `SID_SET_RESULTS.md`. Job 779368, `TEST_LOG.md` run 9.
+
+| | base backend, no localisation | patch scorer + localisation | delta |
+|---|---|---|---|
+| AUC(all AI), clean | 0.759 | **0.919** | +0.160 |
+| AUC(tampered), clean | 0.587 | **0.854** | +0.267 |
+| AUC(tampered), jpeg q30 | 0.555 | **0.367** | **−0.188** |
+| AUC(tampered), downscale ×0.25 | 0.544 | **0.411** | **−0.134** |
+| localisation IoU, clean | 0.041 | **0.416** | +0.375 |
+
+**The pattern from §7 reproduces at the larger sample, on different images, and
+the two halves of it get sharper.** The shipped configuration is far better on
+clean and mildly degraded images (+0.267 AUC(tampered) clean, IoU 10× the base
+backend's) and *worse than a plain whole-image pass* under heavy JPEG and
+downscaling. Isolating localisation alone on this shard, with the patch scorer:
+**+0.279 on clean** and **−0.238 at jpeg q30, −0.158 at downscale ×0.25**
+(AUC(tampered), with-localisation minus without).
+
+Two things this larger run settles that §7 could not:
+
+- **For the base backend, localisation is a small net negative**, not noise:
+  AUC(all AI) with-minus-without is negative in **13 of 14 conditions**, ranging
+  −0.091 to +0.017. §7's ±0.09 interval could not resolve that sign; 50/class
+  can. The region machinery only pays for itself once the backend can actually
+  score a patch.
+- **The failure is not localisation being weak, it is localisation being
+  confidently wrong.** At jpeg q30 the patch scorer's map still has IoU 0.372
+  and recall 0.887 — near its clean-condition quality — while the fused decision
+  falls to 0.367. The map finds the right pixels and the score built on them is
+  worse than chance.
+
+## 9. Why it breaks: the map's score distribution moves, and it moves on real images
+
+§8 leaves an obvious question — is the map mis-*cut* or mis-*informed*? Region
+proposal uses absolute thresholds (`threshold_lo/hi` = 0.45/0.75), so a
+degradation that shifts the whole map up or down changes how much of the frame
+fires without the content changing at all. Job 779811 instrumented the harness to
+answer it: per-class map statistics, the map's median, and the pre-cap
+confidence are now recorded per image. Full tables: `THRESHOLD_RESULTS.md`,
+`TEST_LOG.md` run 10.
+
+**The distribution does move, and it moves asymmetrically.** Mean map median,
+patch scorer, shard 4:
+
+| Condition | on **real** images | on tampered images | real images that grew a region |
+|---|---|---|---|
+| clean | 0.022 | 0.081 | 14% |
+| jpeg q60 | 0.120 | 0.081 | 56% |
+| **jpeg q30** | **0.382** | 0.380 | **96%** |
+| blur σ1.0 | 0.133 | 0.086 | 70% |
+| **blur σ2.0** | **0.683** | 0.287 | **98%** |
+| downscale ×0.25 | 0.228 | 0.051 | 60% |
+| **noise σ0.05** | **0.008** | 0.011 | **0%** |
+
+Read the first two columns together. Under compression and blur the map does not
+lift uniformly — **the real images rise to meet the tampered ones**, and by
+jpeg q60 they have already overtaken them. This is the 64px-crop failure of §4 again, one level
+up: a compressed or blurred real photograph looks, patch by patch, exactly like
+what a patch-scale detector was trained to call generated. Under noise the
+opposite happens — everything collapses to zero and the map switches off (0.09
+regions per image, IoU 0.005), which is why noise is the one severe condition
+where fusing costs nothing: there is nothing to fuse.
+
+### Re-placing the cuts does not fix it
+
+Two shift-invariant threshold modes were added to `mapper/heatmap.py` and run on
+the identical shard-4 frames (`--threshold_mode quantile | median_shift`):
+
+| Mode | mean AUC(tampered) | worst condition | mean loc IoU | real images firing, clean |
+|---|---|---|---|---|
+| absolute (shipped) | 0.693 | 0.368 | 0.306 | 14% |
+| quantile | 0.693 | 0.372 | 0.218 | 38% |
+| median_shift | **0.708** | 0.378 | **0.346** | 42% |
+
+**Neither rescues detection.** `median_shift` is the better *localiser* — higher
+IoU in 11 of 14 conditions, and it is what recovers blur σ2.0 (0.500 → 0.668) —
+but it buys that by firing on three times as many authentic photographs on clean
+data, and the worst condition barely moves (0.368 → 0.378). `quantile` is worse
+on both counts: cutting at a map's own upper tail manufactures a tail on a map
+that has none.
+
+**Both halves of that replicate held-out.** Job 780095 reran the same two modes
+on shard 3 at 50/class: `median_shift` again wins IoU in **11 of 14** conditions
+(mean 0.264 → 0.318) and again pays for it on authentic photographs (8% → 28%
+firing on clean data), with mean AUC(tampered) 0.692 → 0.703 and the worst
+condition slightly *worse*, 0.376 → 0.333. The shipped default stays `absolute`;
+`median_shift` is the right choice only for a deployment that wants the map
+itself and can afford the false positives.
+
+The conclusion is the same shape as §4's, and worth as much: **at these
+severities the per-patch signal is gone, not mis-cut.** The whole-image pass on
+the same jpeg q30 images still separates real from tampered at 0.605 while every
+fused variant sits at 0.37–0.45. No threshold placement recovers information the
+patches no longer carry.
+
+### The confidence signal was never flat — the cap was hiding it
+
+§6 recorded confidence as a constant 0.60 in every condition and called the
+signal inert. That was the *reported* number. `fusion.py` now also records
+`confidence_uncapped`, the value before `UNCALIBRATED_CONFIDENCE_CAP` clamps it,
+and it is not flat: mean 0.875 clean, 0.813 at jpeg q60, **0.784 at jpeg q30**,
+with the cap binding on **98%** of images. The mechanism designed to say "I can
+no longer tell" works; it was being flattened on the way out. That is what makes
+§10 possible.
+
+## 10. Routing, not robustness: decide per image whether to believe the map
+
+§8 and §9 together say localisation is both the entire gain and the entire
+fragility, and that it cannot be made robust by rescaling. So the question
+changes from *how do we make the map survive degradation* to *can the system
+tell, per image, when not to listen to it* — and fall back to the whole-image
+score it already computes.
+
+It can. Ten candidate signals were searched by leave-one-condition-out on shard
+4; the winner is the pre-cap confidence of §9, with a cut at **0.8577**. Below
+it, the score comes from the whole-image pass and the regions are not reported
+(`dual_backend.py`, `eval/validate_gate.py`).
+
+### Held out on a shard the gate never saw
+
+The gate was tuned on shard 4, so shard 4 cannot score it. Job 780095 reran the
+patch scorer on **shard 3** at 50/class with the threshold **frozen as a
+literal** — nothing refitted — and replayed the rule offline. `AUC(real vs
+tampered)`, 14 conditions:
+
+| | always fuse | always whole-image | **gate** |
+|---|---|---|---|
+| mean over 14 conditions | 0.692 | 0.665 | **0.803** |
+| worst condition | 0.376 | 0.528 | **0.687** |
+| conditions below 0.5 | 3 | 0 | **0** |
+| clean | 0.847 | 0.665 | 0.856 |
+| jpeg q30 | 0.376 | 0.598 | **0.775** |
+
+Shard 4's own numbers were mean 0.693 → 0.806 and worst 0.368 → 0.666. **The
+held-out shard reproduces both to within 0.02**, and the tuning optimism is
+measurable and tiny: shard 3's own best threshold (0.8744) would have scored
+0.807 against the frozen threshold's 0.803.
+
+On AUC(real vs all AI) the same rule gives mean 0.809 → **0.890**, worst 0.473 →
+**0.836**, and it moves the false-positive rate the whole project has been stuck
+on: at 80% recall on AI, **0.080 → 0.040 on clean images** (the base backend's
+was 0.44).
+
+Paired bootstrap on shard 3, gate minus always-fuse:
+
+| Condition | AUC(tampered) delta | 95% CI |
+|---|---|---|
+| clean | +0.009 | [−0.063, +0.080] |
+| jpeg q30 | **+0.400** | [+0.224, +0.567] |
+
+**That is the shape a fix should have.** It is a wash where the map was already
+right and a large, significant recovery exactly where the map was lying. The
+gate is not adding detection power; it is declining to destroy it.
+
+### The class, not the replay — and what the gate costs
+
+Everything above is an offline replay of the rule over per-image JSON. Job 780205
+ran `DualBackendAnalyzer` itself over shard 3, 50/class, threshold frozen, and
+reproduces the replay to within 0.001 on every summary statistic: mean
+AUC(tampered) **0.803**, worst **0.687**, mean AUC(all AI) **0.890**, worst
+0.837. The gate declines to trust localisation on
+**36%** of images on average — 23% on clean, 75% at jpeg q30.
+
+That is the cost, and it is the honest way to state the result: **reported**
+localisation IoU falls from 0.264 to **0.181**, because a distrusted image
+contributes an empty mask. The gate buys its detection robustness by giving up
+localisation on the images it does not believe — which is the correct trade only
+if the score matters more than the map. `dual_backend.py` drops the findings
+rather than reporting them beside a score that ignored them, and the harness
+scores localisation on what was reported, so this cost cannot be hidden by
+measuring the map the pipeline privately computed.
+
+### Three things the gate gets wrong if built as a bare `if`
+
+1. **The two scores are not on the same scale.** Substituting one for the other
+   shifts the ranking for reasons unrelated to the image. Rank-normalising both
+   arms within a condition first — the conservative reading — cuts the gain from
+   +0.111 to **+0.034** mean on shard 3 (worst-condition +0.311 → +0.185). Both
+   numbers are reported by `eval/validate_gate.py`; the raw one is what a
+   deployment doing exactly this substitution gets, the rank one is what the gate
+   is worth net of scale effects. `ScoreAligner` exists to remove that gap when
+   the fallback is a *separate* model.
+2. **Falling back means the regions are not trusted either.** When the gate
+   fires, `dual_backend.py` drops the findings and says why in a note — reporting
+   a fallback score beside the regions it just overruled invites belief in both.
+   That is what the IoU cost above is measuring.
+3. **The threshold is not a universal constant.** It was tuned against the patch
+   scorer under absolute cuts. Carried unchanged onto `median_shift` cuts it made
+   results worse than either arm alone, so it lives in config, per deployment.
+
+### The fallback should be the primary's own global view, not a second model
+
+Mean AUC(tampered) over 14 shard-4 conditions: primary alone 0.693, **self-
+fallback 0.806**, a separate `Organika/sdxl-detector` as fallback 0.745 (0.728
+with the fitted quantile alignment). Job 780205 ran both arms for real on shard
+3 and reproduces it: **self 0.803 against separate 0.714**, worst condition
+0.687 against 0.581, self winning **13 of 14** conditions. Both arms distrust
+the same 36% of images and report the same localisation — the gate is identical;
+only the substituted number differs.
+
+The useful split is therefore between two *pathways* — local evidence versus
+global — not between two detectors, and the fine-tuned backend's own whole-image
+pass is the better global view. It is also free: `analyze.py` already computes
+that score and hands it to `fuse()`, so the default `fallback.backend: "self"`
+costs no extra forward pass. `ScoreAligner` stays for the case where someone does
+want a separate model; it is not what closes this gap (alignment made shard 4's
+separate arm slightly *worse*, 0.745 → 0.728).
+
+---
+
 ## What to do next, in order of expected value
 
-1. **Train a patch-scale detector.** Every result here is bounded by asking a
-   whole-image model about 64px crops, and §4 is direct evidence that the
-   problem cannot be patched downstream. SID-Set's train split (210k images with
-   masks) is public and sufficient; `mapper/backends.py` accepts a new backend
-   without any other change. This is the only item likely to move the numbers a
-   lot.
-2. **Make `confidence` mean something.** §6 shows it is a constant 0.60 in every
-   condition, so the pipeline's one mechanism for saying "the evidence has been
-   degraded, do not trust this" is inert. Either the uncalibrated cap has to go,
-   or confidence has to be driven by something that actually varies — map
-   support and scale agreement are already computed and currently only reach it
-   through a term the cap flattens.
-3. **Fix verdict instability under noise** (9% stability at σ=0.05 with AUC
-   unchanged). The score ranking survives while the labels churn, which points
-   at the verdict thresholds rather than the evidence. Hysteresis, or deciding
-   the label from the same margin the score is built on, would both help.
-4. **Re-run with the verdict fix** to get honest `ai_edited` vs `ai_generated`
-   numbers.
-5. **Attack the false-positive rate directly** rather than through calibration —
-   for example requiring corroboration across scales before proposing a region,
-   instead of `max`.
-6. **Compare backends** (§ EVALUATION.md) — these numbers describe
-   `Organika/sdxl-detector`, and a different feature family may behave
-   differently on crops.
+The previous list's item 1 (train a patch-scale detector) is done —
+`checkpoints/patch_scorer`, `TEST_LOG.md` runs 3/5b. Item 2 (make `confidence`
+mean something) is half done: the signal turns out to exist and to be useful
+(§9, §10), but what the pipeline *reports* is still a constant 0.60, so anything
+downstream reading `confidence` is still reading nothing. What follows replaces
+the rest.
+
+1. **Decide whether the gate ships, and measure it end to end.** §10 validates
+   the *rule* on held-out data, and `TEST_LOG.md` run 12 exercises the class on
+   real images, but `configs/default.yaml` still runs the ungated pipeline and
+   the server does not import `dual_backend.py`. Wiring it in means choosing the
+   threshold per deployment (it is not a constant — §10) and re-running §1–§3's
+   detection/localisation/false-positive tables through the gated path, since
+   every number in them predates it.
+2. **The decision rule is still not the one the evidence recommends.** The
+   `max` map reduction scored AUC 0.980 / 0.979 on two shards
+   (`TEST_LOG.md` runs 5b, 6) against the shipped `region_evidence` design's
+   ~0.82 through `fuse()`. That gap has been open since 2026-08-31 03:02 and is
+   independent of everything in §8–§10 — the gate decides *whether* to use the
+   map, not how to reduce it.
+3. **Fix verdict instability directly.** It survived every change here: at noise
+   σ0.05 only 30–44% of images keep their clean verdict while AUC is unchanged,
+   and the gate does not help because it substitutes a *score*, not a label.
+   Hysteresis, or deriving the label from the same margin the score is built on.
+4. **Push past a single 50/class shard.** Every §8–§10 number has ~±0.05 on it.
+   The gate's held-out reproduction (0.803 vs 0.806) is well inside that, which
+   is reassuring, but the per-condition rows are not individually significant.
+5. **Attack the patch-level fragility at its source** rather than routing around
+   it: §9 shows degraded *real* patches are what the patch scorer misreads, so
+   training with degradation-augmented hard negatives is the direct fix, and the
+   one that would let localisation be trusted under compression instead of
+   switched off.
+6. **Re-run with the verdict fix** to get honest `ai_edited` vs `ai_generated`
+   numbers (§5), and **compare backends** (§ EVALUATION.md) — every number here
+   describes one feature family.
 
 ## Caveats that bound every number here
 
@@ -383,7 +646,14 @@ fix as everywhere else in this document: more images per condition.
   images come from OpenImages, which appears in many training sets, so
   **detection AUC is an upper bound**. The localisation numbers are the
   trustworthy ones — no whole-image detector could have memorised a mask.
-- **n = 120 per class.** AUC standard error is roughly ±0.03; differences
-  smaller than that are noise, which is why the ablation reports bootstrap
-  intervals rather than bare deltas.
-- One backend, one dataset, one working resolution.
+- **n = 120 per class** in §1–§5, **15** in §6–§7, **50** in §8–§10. AUC standard
+  error is roughly ±0.03, ±0.09 and ±0.05 respectively; differences smaller than
+  that are noise, which is why the ablation and §10 report bootstrap intervals
+  rather than bare deltas.
+- One backend family, one dataset, one working resolution. §8–§10 all run at
+  768px on SID-Set validation; the shipped default is 1024px, and CIFAKE
+  (`CIFAKE_RESULTS.md`) is the only other dataset tried — where the window
+  mapper degenerates entirely on 32px images.
+- **The gate's threshold (0.8577) is fitted, not derived.** It was tuned on
+  shard 4 and validated frozen on shard 3; it is specific to this checkpoint,
+  these absolute cuts and this working resolution.

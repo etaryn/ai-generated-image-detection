@@ -319,9 +319,10 @@ python tests/test_calibration.py    # monotonicity, ECE improvement, bad-fit ref
 python tests/test_labels.py         # which output means "AI" -- incl. the reversed model
 python tests/test_backends.py       # backend spec parsing; settings are never dropped
 python tests/test_pipeline.py       # end to end + the two conservatism rules in fusion
+python tests/test_dual_backend.py   # trust gate, score alignment, dropped findings on fallback
 ```
 
-They are `pytest`-discoverable too (`pytest tests/`). All 62 pass in this
+They are `pytest`-discoverable too (`pytest tests/`). All 101 pass in this
 project's dev environment (Python 3.13, numpy 2.5, Pillow 12), none of them
 needing network or a GPU. The pipeline has additionally been run end to end
 against the real `Organika/sdxl-detector` weights: on this repo's CIFAKE

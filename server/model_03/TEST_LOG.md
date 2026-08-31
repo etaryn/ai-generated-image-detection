@@ -6,7 +6,7 @@ command/script/job that produced it. `EVALUATION.md` and
 `EVALUATION_RESULTS.md` are the narrative write-ups of a subset of this; this
 document is the complete chronological record, including the runs that don't
 appear in either (the training runs, the decision-rule sweep, the held-out
-check, and the two newest cross-dataset comparisons).
+check, the cross-dataset comparisons, and the threshold/gate diagnostics).
 
 **Convention carried over from `EVALUATION.md`: no number below should exist
 that can't be regenerated.** Every entry gives the reproduction command. Job
@@ -25,12 +25,16 @@ IDs are this cluster's Slurm IDs (`sacct -j <id>`), logs are
 | 6 | 2026-08-31 03:08–03:50 | 777091 `aigc-m03-heldout` | `eval/evaluate.py` + `eval/ablation.py` + `scripts/fit_decision.py` | SID-Set val shard 2, 120/class | Does everything above generalise to data untouched by training or decision-fitting? |
 | 7 | 2026-08-31 11:58–15:17 (×3) | 778211 / 778685 / 778939 `aigc-m03-robust` | `eval/robustness.py` | SID-Set val shard 3, 15/class | Transform × severity matrix, base vs patch scorer, paired |
 | 8 | 2026-08-31 16:21–16:27 | 779287 `aigc-m03-cifake` | `eval/fetch_cifake.py` + `eval/robustness.py` + `eval/report_cifake.py` | CIFAKE, 100/class | Same robustness comparison, on a real/synthetic-only dataset with no partially-AI case |
-| 9 | 2026-08-31 16:43– (running) | 779368 `aigc-m03-sidset` | `eval/fetch_sid_set.py` + `eval/robustness.py` + `eval/report_robustness.py` | SID-Set val shard 4, 50/class | Same robustness comparison, fresh SID-Set shard, bigger sample |
+| 9 | 2026-08-31 16:43–18:14 | 779368 `aigc-m03-sidset` | `eval/fetch_sid_set.py` + `eval/robustness.py` + `eval/report_robustness.py` | SID-Set val shard 4, 50/class | Same robustness comparison, fresh SID-Set shard, bigger sample |
+| 10 | 2026-08-31 18:40–20:17 | 779811 `aigc-m03-diag` | `eval/robustness.py` (instrumented) ×4 + `eval/report_thresholds.py` | SID-Set val shard 4, 50/class | Why does fusion invert under degradation? Absolute vs quantile vs median_shift cuts, and can trust be routed per image? |
+| 11 | 2026-08-31 20:38–21:26 | 780095 `aigc-m03-val3` | `eval/robustness.py` ×2 + `eval/validate_gate.py` | SID-Set val shard 3, 50/class | Held-out test of run 10's two findings, constants frozen |
+| 12 | 2026-08-31 21:03–21:52 | 780205 `aigc-m03-dual` | `pytest tests/` + `eval/robustness.py --dual` ×2 | SID-Set val shard 3, 50/class | First real-backend run of `DualBackendAnalyzer`, and the first test run over the modified pipeline |
 
 Rows 1–7 correspond to material already narrated in `EVALUATION.md` /
 `EVALUATION_RESULTS.md`; the tables below reproduce their numbers alongside
 the run parameters those documents don't spell out (job ID, exact config,
-image counts by class). Rows 8–9 are new and have no other write-up yet.
+image counts by class). Rows 9–12 are written up in `EVALUATION_RESULTS.md`
+§8–§10; row 8 (CIFAKE) has `CIFAKE_RESULTS.md` and this log only.
 
 ---
 
@@ -503,13 +507,256 @@ then the new general-purpose `eval/report_robustness.py` (handles the
 this log — 3/5b/6 used shards 0–2 for training/fitting, 7 used shard 3),
 50/class = 150 images per condition.
 
-**Status: running as of this document.** Job **779368** `aigc-m03-sidset`,
-started 2026-08-31 16:43:57 on the `gpu` partition (3h budget; runs 7's
-comparable-sized runs took ~30 min at a third the sample, so this is expected
-to land in 1.5–2h). Results land at
-`eval_results/robustness_sidset_shard4_{base,patch_scorer}.json` and
-`server/model_03/SID_SET_RESULTS.md`. This entry will be filled in once it
-completes — check `./jobstatus.sh` or ask for a status check.
+**Result — headline, plain baseline vs the full upgrade** (`auc_real_vs_tampered`,
+and `auc_real_vs_all_ai`; full tables in `SID_SET_RESULTS.md`):
+
+| Condition | base, no localisation | patch scorer + localisation | delta |
+|---|---|---|---|
+| clean | 0.587 | **0.854** | +0.267 |
+| jpeg q90 | 0.592 | **0.872** | +0.280 |
+| jpeg q60 | 0.387 | 0.594 | +0.207 |
+| **jpeg q30** | 0.555 | **0.367** | **−0.188** |
+| blur σ0.5 | 0.590 | **0.835** | +0.245 |
+| blur σ1.0 | 0.576 | 0.554 | −0.023 |
+| blur σ2.0 | 0.562 | 0.501 | −0.061 |
+| downscale ×0.5 | 0.568 | 0.575 | +0.007 |
+| **downscale ×0.25** | 0.544 | **0.411** | **−0.134** |
+| noise σ0.02 | 0.589 | **0.775** | +0.186 |
+| noise σ0.05 | 0.630 | 0.726 | +0.096 |
+| crop 0.9 | 0.587 | **0.872** | +0.285 |
+| crop 0.8 | 0.635 | **0.871** | +0.235 |
+| saturate ×1.5 | 0.603 | **0.901** | +0.298 |
+
+On AUC(all AI) the same comparison runs 0.759 → 0.919 clean and 0.735 → 0.430 at
+jpeg q30. Localisation, patch scorer: mean IoU 0.416 clean (base: 0.041), and
+**still 0.372 at jpeg q30** while the fused decision there is below chance.
+
+**Conclusion — run 7's pattern reproduces at 3.3× the sample, and two things it
+could not resolve are now resolved:**
+
+1. **For the base backend, localisation is a small net negative**, not noise:
+   AUC(all AI) with-minus-without is negative in **13 of 14** conditions
+   (−0.091 to +0.017). At 15/class the ±0.09 interval could not establish that
+   sign.
+2. **The patch scorer's failure mode is confident wrongness, not weakness.** At
+   jpeg q30 the map keeps near-clean quality (IoU 0.372, recall 0.887) while the
+   score built on it inverts; at downscale ×0.25 the map itself degrades (IoU
+   0.416 → 0.123) and fusion trusts it anyway. Both are the map being believed
+   when it should not be — which is what run 10 goes after.
+
+Verdict stability under noise is unchanged from run 7 (0.34 at σ0.05 for the
+patch scorer, 0.30 base), and mean reported confidence is a flat 0.60
+everywhere — the finding run 10 shows to be an artifact of the cap.
+
+**Source:** `server/model_03/SID_SET_RESULTS.md` (generated by
+`eval/report_robustness.py`), narrated in `EVALUATION_RESULTS.md` §8. Job
+**779368** `aigc-m03-sidset`, 2026-08-31 16:43:57 → 18:14:30, 1h30m33s,
+`slurm_logs/model03_sidset_779368.{out,err}`. Raw data:
+`eval_results/robustness_sidset_shard4_{base,patch_scorer}.json`.
+
+---
+
+## 10. Threshold-mode diagnostic — why fusion inverts, and can it be re-cut?
+
+**Question:** run 9 leaves the map firing accurately and the decision built on
+it inverting. Two hypotheses: the map's scores are *mis-cut* (region proposal
+uses absolute thresholds, and degradation shifts the score distribution
+bodily), or the per-patch signal is simply *gone* at those severities. If it is
+the first, re-placing the cuts fixes it.
+
+**Parameters:** four paired arms on the identical frames, `eval/robustness.py
+--data_dir <shard 4> --limit 50 --max_side 768`:
+
+| Arm | Backend | `--threshold_mode` |
+|---|---|---|
+| 1 | `checkpoints/patch_scorer` | `absolute` (shipped) |
+| 2 | `checkpoints/patch_scorer` | `quantile` |
+| 3 | `checkpoints/patch_scorer` | `median_shift --adaptive_ref_median 0.3660738479313538` |
+| 4 | `hf:Organika/sdxl-detector` | `absolute` |
+
+The `median_shift` reference median is **measured from arm 1's own clean
+condition inside the job**, not hardcoded, so the constant belongs to the same
+backend and working resolution it is applied at. This run also added the
+instrumentation everything after it depends on: per-class map statistics, the
+map median, `confidence_uncapped`, and the full `per_image` rows in the output
+JSON (`eval/robustness.py`, `fusion.py`, `mapper/heatmap.py`).
+
+**Dataset:** SID-Set validation **shard 4**, 50/class — deliberately the same
+sample as run 9, so every arm is directly comparable to
+`robustness_sidset_shard4_*.json`.
+
+**Result — the distribution shift is real, and it is on the real images:**
+
+| Condition | mean map median, **real** | mean map median, tampered | real images that grew a region |
+|---|---|---|---|
+| clean | 0.022 | 0.081 | 14% |
+| jpeg q60 | 0.120 | 0.081 | 56% |
+| jpeg q30 | **0.382** | 0.380 | **96%** |
+| blur σ1.0 | 0.133 | 0.086 | 70% |
+| blur σ2.0 | **0.683** | 0.287 | **98%** |
+| downscale ×0.25 | 0.228 | 0.051 | 60% |
+| noise σ0.05 | 0.008 | 0.011 | **0%** |
+
+**Result — re-cutting does not fix detection:**
+
+| Mode | mean AUC(tampered) | worst condition | mean loc IoU | real images firing, clean |
+|---|---|---|---|---|
+| absolute | 0.693 | 0.368 | 0.306 | 14% |
+| quantile | 0.693 | 0.372 | 0.218 | 38% |
+| median_shift | **0.708** | 0.378 | **0.346** | 42% |
+
+`median_shift` beats `absolute` on IoU in **11 of 14** conditions and recovers
+blur σ2.0 (0.500 → 0.668), but triples the clean false-positive rate and barely
+moves the worst condition.
+
+**Result — the confidence signal is not flat, the cap is:** `confidence_uncapped`
+averages 0.875 clean, 0.813 at jpeg q60, 0.784 at jpeg q30, with the
+uncalibrated cap binding on **98%** of images. Gating on it (cut 0.8577, chosen
+by leave-one-condition-out over ten candidate signals) takes mean AUC(tampered)
+from 0.693 to **0.806** and the worst condition from 0.368 to **0.666**;
+rank-normalising both arms first — which removes any gain that is merely the
+two score scales sitting apart — leaves **+0.038** mean. A separate
+`sdxl-detector` as the fallback measured worse (0.745; 0.728 with a fitted
+quantile alignment) than reusing the patch scorer's own whole-image pass.
+
+**Conclusion:** the per-patch signal is gone rather than mis-cut — the
+whole-image pass still separates at 0.605 at jpeg q30 while every fused variant
+sits at 0.37–0.45. Threshold placement is therefore a *localisation* knob, not a
+robustness fix, and the productive move is to decide per image whether to
+believe the map at all. That is what `dual_backend.py` implements and what runs
+11 and 12 test.
+
+**Source:** `server/model_03/THRESHOLD_RESULTS.md` (generated by
+`eval/report_thresholds.py`), narrated in `EVALUATION_RESULTS.md` §9–§10. Job
+**779811** `aigc-m03-diag`, 2026-08-31 18:40:00 → 20:17:31, 1h37m31s,
+`slurm_logs/model03_diag_779811.{out,err}` (job 779757 is the same script
+cancelled at submit time). Raw data: `eval_results/diag_shard4_{ps_absolute,
+ps_quantile,ps_median_shift,base_absolute}.json`. New/changed code:
+`mapper/heatmap.py` (`threshold_mode`), `fusion.py` (`confidence_uncapped`),
+`eval/robustness.py` (per-class stats, `per_image` rows), `dual_backend.py`,
+`eval/report_thresholds.py`, `scripts/fit_score_alignment.py`.
+
+---
+
+## 11. Held-out validation — the shard-4 findings with the constants frozen
+
+**Question:** run 10 chose a threshold mode and a gate threshold *on shard 4*.
+Both were selected by searching that shard, so shard 4 cannot score them. Do
+they survive on data neither was fitted on?
+
+**Parameters:** `eval/robustness.py --data_dir <shard 3> --limit 50 --max_side
+768 --backend checkpoints/patch_scorer`, twice: `--threshold_mode absolute`, and
+`--threshold_mode median_shift --adaptive_ref_median 0.3660738479313538` — the
+reference median **carried over from shard 4 as a literal**. The gate threshold
+0.8577 likewise stays a literal in `eval/validate_gate.py`; `--retune` reports
+what this shard would have chosen, as a diagnostic only.
+
+**Dataset:** SID-Set validation **shard 3**, 50/class. A different parquet file
+from shard 4, so the images are disjoint. Runs 7's shard-3 numbers used 15/class
+and the uninstrumented harness; this writes to its own files
+(`val3_shard3_*.json`), so nothing already cited is overwritten.
+
+**Result — the gate reproduces** (`AUC(real vs tampered)`, 14 conditions):
+
+| | always fuse | always whole-image | gate | shard 4's gate |
+|---|---|---|---|---|
+| mean | 0.692 | 0.665 | **0.803** | 0.806 |
+| worst | 0.376 | 0.528 | **0.687** | 0.666 |
+| conditions below 0.5 | 3 | 0 | **0** | 0 |
+| clean | 0.847 | 0.665 | 0.856 | 0.854 |
+| jpeg q30 | 0.376 | 0.598 | **0.775** | 0.841 |
+
+On AUC(real vs all AI): mean 0.809 → **0.890**, worst 0.473 → **0.836**, and FPR
+at 80% recall on clean data 0.080 → **0.040**. Rank-normalised, the gain is
++0.034 mean / +0.185 worst. `--retune` puts the tuning optimism at 0.004: shard
+3's own best threshold (0.8744) would have scored 0.807 against the frozen
+threshold's 0.803.
+
+**Result — the threshold-mode finding reproduces, including its cost:**
+`median_shift` again wins IoU in **11 of 14** conditions (mean 0.264 → 0.318),
+again fires on far more authentic photographs (8% → 28% clean), and again fails
+to fix detection (mean AUC(tampered) 0.692 → 0.703, worst 0.376 → **0.333**).
+
+**Conclusion:** both shard-4 findings are real, and the gate's held-out summary
+statistics land within 0.021 of their tuning-shard values (mean 0.803 vs 0.806,
+worst 0.687 vs 0.666); individual conditions move more, as the sample size
+implies. `absolute`
+stays the default; `median_shift` is a localisation option for a deployment that
+can afford the false positives.
+
+**Source:** narrated in `EVALUATION_RESULTS.md` §9–§10. Job **780095**
+`aigc-m03-val3`, 2026-08-31 20:38:57 → 21:26:05, 47m08s,
+`slurm_logs/model03_val3_780095.{out,err}`. Raw data:
+`eval_results/val3_shard3_ps_{absolute,median_shift}.json`. Replay:
+`python eval/validate_gate.py eval_results/val3_shard3_ps_absolute.json --retune`.
+
+---
+
+## 12. Dual-backend run — the class itself, and the first test pass over the new code
+
+**Question:** two gaps. Everything about the gate so far was replayed offline
+from per-image JSON, so `DualBackendAnalyzer` had never actually run; and
+`fusion.py`, `mapper/heatmap.py` and `eval/robustness.py` were all modified in
+run 10 without the test suite ever seeing the changes — the login node has
+neither torch nor pytest.
+
+**Parameters:** `python -m pytest tests/ -q` (the sbatch deliberately does *not*
+use `set -e`, so a failing suite still reports and the run continues), then
+`eval/robustness.py --data_dir <shard 3> --limit 50 --max_side 768 --backend
+checkpoints/patch_scorer --dual` twice: `--fallback_backend self` and
+`--fallback_backend hf:Organika/sdxl-detector`. The trust threshold stays the
+frozen shard-4 value; `eager` scoring is on so both arms exist for every frame
+in one pass.
+
+**Dataset:** SID-Set validation shard 3, 50/class — the same sample as run 11,
+so the class's output is directly comparable with run 11's offline replay.
+
+**Result — tests: 101 passed** (`test_dual_backend.py` is new: 22 of them),
+first green run over the `threshold_mode` code path.
+
+**Result — the class reproduces the replay exactly:**
+
+| | ungated (run 11) | `--dual --fallback_backend self` |
+|---|---|---|
+| mean AUC(tampered) | 0.692 | **0.803** |
+| worst condition | 0.376 | **0.687** |
+| mean AUC(all AI) | 0.809 | **0.890** |
+| worst AUC(all AI) | 0.473 | **0.837** |
+| mean reported localisation IoU | 0.264 | **0.181** |
+
+The gate distrusts localisation on **36%** of images on average (23% clean, 75%
+at jpeg q30). The IoU row is the cost, and it is reported rather than hidden: a
+distrusted image contributes an empty mask, because `dual_backend.py` drops the
+findings when it declines to believe them and the harness scores localisation on
+what the system actually reported.
+
+**Result — a separate model is the worse fallback, held out too:**
+
+| Fallback | mean AUC(tampered) | worst | mean AUC(all AI) | worst |
+|---|---|---|---|---|
+| `self` (the patch scorer's own whole-image pass) | **0.803** | **0.687** | **0.890** | **0.837** |
+| `hf:Organika/sdxl-detector` | 0.714 | 0.581 | 0.824 | 0.717 |
+
+`self` wins **13 of 14** conditions. Both arms distrust the same 36% of images
+and report the same localisation (0.181 IoU) — the gate is identical, only the
+number substituted differs. This arm ran **unaligned** (`--dual` does not take an
+`alignment_path`, so `ScoreAligner` is the identity and the run's own notes say
+so); run 10's offline analysis measured the aligned variant too and it was no
+better (0.745 unaligned / 0.728 aligned on shard 4), so alignment is not what is
+missing — a second detector's global view is simply worse than the fine-tuned
+backend's own.
+
+**Conclusion:** the gate is a real, working component and not an artifact of
+offline replay, and the cheap version of it is the right one — no second model,
+no extra forward pass. It buys detection robustness by giving up localisation on
+the images it does not trust, which is the right trade only where the score
+matters more than the map; that is a deployment decision, not a measurement.
+
+**Source:** narrated in `EVALUATION_RESULTS.md` §10. Job **780205**
+`aigc-m03-dual`, 2026-08-31 21:03:49 → 21:52:46, 48m57s,
+`slurm_logs/model03_dual_780205.{out,err}`. Raw data:
+`eval_results/dual_shard3_{self,separate}.json`. Reproduce with
+`test_model03_dual.sbatch`.
 
 ---
 
@@ -520,12 +767,15 @@ completes — check `./jobstatus.sh` or ask for a status check.
 | Current patch-scorer checkpoint | `checkpoints/patch_scorer/` (from run 5b; run 3's original 1,800-image checkpoint was overwritten, backed up off-repo to `$SCRATCH/patch_scorer_prev`) |
 | Calibrator (fitted, not used by default) | `configs/calibration_sdxl_detector.json` |
 | Uncalibrated config (shipped default behaviour) | `configs/uncalibrated.yaml`; `configs/default.yaml` also carries `calibration_path: null` since run 2 |
-| Fetch scripts | `eval/fetch_sid_set.py` (SID-Set, 3-class + masks), `eval/fetch_cifake.py` (CIFAKE, 2-class, new) |
-| Evaluation scripts | `eval/evaluate.py` (detection+localisation+false-positives, one run), `eval/ablation.py` (with/without-localisation comparison from one `evaluate.py` output), `eval/robustness.py` (transform × severity matrix, both arms per run) |
+| Fetch scripts | `eval/fetch_sid_set.py` (SID-Set, 3-class + masks), `eval/fetch_cifake.py` (CIFAKE, 2-class) |
+| Evaluation scripts | `eval/evaluate.py` (detection+localisation+false-positives, one run), `eval/ablation.py` (with/without-localisation comparison from one `evaluate.py` output), `eval/robustness.py` (transform × severity matrix, both arms per run; since run 10 also `--threshold_mode`, `--dual`, per-class stats and `per_image` rows) |
 | Decision-rule tooling | `scripts/fit_decision.py` (sweeps map-reduction strategies; not yet reconciled with `fuse()`'s shipped design — see run 5b) |
-| Report generators | `eval/report.py` (detection/localisation tables from `evaluate.py` JSON), `eval/report_cifake.py` (CIFAKE-specific robustness report, carries the windowing-collapse caveat), `eval/report_robustness.py` (general-purpose, new — handles a `tampered` class when present) |
-| Slurm scripts | `test_model03_*.sbatch`, `train_model03_*.sbatch`, `eval_model03_patch_scorer.sbatch` at the repo root |
+| Trust-routing tooling (new, runs 10–12) | `dual_backend.py` (`DualBackendAnalyzer` + `ScoreAligner`; the frozen threshold lives here), `eval/validate_gate.py` (held-out replay of the frozen gate, raw and rank-normalised), `scripts/fit_score_alignment.py` + `configs/score_alignment_patch_scorer_vs_sdxl.json` (only needed when the fallback is a separate model) |
+| Report generators | `eval/report.py` (detection/localisation tables from `evaluate.py` JSON), `eval/report_cifake.py` (CIFAKE-specific robustness report, carries the windowing-collapse caveat), `eval/report_robustness.py` (general-purpose — handles a `tampered` class when present), `eval/report_thresholds.py` (threshold modes + routing, new in run 10) |
+| Result documents | `EVALUATION.md` (how to evaluate + standing findings), `EVALUATION_RESULTS.md` (the narrative results), `CIFAKE_RESULTS.md` (run 8), `SID_SET_RESULTS.md` (run 9), `THRESHOLD_RESULTS.md` (run 10) |
+| Slurm scripts | `test_model03_*.sbatch`, `train_model03_*.sbatch`, `eval_model03_patch_scorer.sbatch`, `diag_model03_thresholds.sbatch`, `validate_model03_shard3.sbatch` at the repo root |
 | Slurm logs | `slurm_logs/model03_*_<jobid>.{out,err}` at the repo root |
+| Unit tests | `tests/` — 101 as of run 12, all passing on GPU with torch installed |
 
 Regenerate this document's numbers with the commands quoted in each section;
 nothing here was typed from memory.
