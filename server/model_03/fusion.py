@@ -209,6 +209,11 @@ def fuse(
         )
     )
     capped_by_calibration = False
+    # Keep the pre-cap value: on an uncalibrated map the cap saturates almost
+    # every image at 0.60, so the reported confidence cannot show whether the
+    # system is actually becoming less sure under degradation. Reporting only
+    # the capped number makes a saturated signal look like a stable one.
+    confidence_uncapped = confidence
     if not amap.calibrated:
         capped_by_calibration = confidence > UNCALIBRATED_CONFIDENCE_CAP
         confidence = min(confidence, UNCALIBRATED_CONFIDENCE_CAP)
@@ -249,6 +254,7 @@ def fuse(
             "regions": len(findings),
             "map": amap.summary(),
             "confidence_capped_by_calibration": capped_by_calibration,
+            "confidence_uncapped": confidence_uncapped,
         },
     )
 

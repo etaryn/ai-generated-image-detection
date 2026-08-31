@@ -85,6 +85,9 @@ class AILikelihoodMap:
         heat = self.heat[~np.isnan(self.heat)]
         return {
             "mean_score": float(heat.mean()) if heat.size else float("nan"),
+            # The location statistic the adaptive cuts key off, so a run can
+            # report the reference median it should have been corrected toward.
+            "median_score": float(np.median(heat)) if heat.size else float("nan"),
             "max_score": float(heat.max()) if heat.size else float("nan"),
             "p95_score": float(np.percentile(heat, 95)) if heat.size else float("nan"),
             "frac_likely_ai": self.fraction(LABEL_AI),
@@ -119,6 +122,11 @@ class AILikelihoodMapper:
         scale_combine: str = "max",
         cascade: bool = False,
         cascade_gate: float | None = None,
+        threshold_mode: str = "absolute",
+        adaptive_q_hi: float = 0.97,
+        adaptive_q_lo: float = 0.80,
+        adaptive_min_spread: float = 0.05,
+        adaptive_ref_median: float = 0.5,
     ):
         if not 0.0 <= threshold_lo <= threshold_hi <= 1.0:
             raise ValueError(
@@ -139,6 +147,15 @@ class AILikelihoodMapper:
         self.scale_combine = scale_combine
         self.cascade = bool(cascade)
         self.cascade_gate = cascade_gate
+        if threshold_mode not in ("absolute", "quantile", "median_shift"):
+            raise ValueError(
+                f"threshold_mode must be absolute|quantile|median_shift, got {threshold_mode!r}"
+            )
+        self.threshold_mode = threshold_mode
+        self.adaptive_q_hi = float(adaptive_q_hi)
+        self.adaptive_q_lo = float(adaptive_q_lo)
+        self.adaptive_min_spread = float(adaptive_min_spread)
+        self.adaptive_ref_median = float(adaptive_ref_median)
 
     def _to_working(self, image: Image.Image) -> Image.Image:
         rgb = image.convert("RGB")
@@ -247,7 +264,7 @@ class AILikelihoodMapper:
             working_size=(width, height),
             original_size=image.size,
             working_image=work,
-            thresholds=(self.threshold_lo, self.threshold_hi),
+            thresholds=self._effective_thresholds(smoothed),
             calibrated=bool(self.calibrator.fitted),
             meta={
                 "backend": getattr(self.scorer, "name", "unknown"),
@@ -256,14 +273,70 @@ class AILikelihoodMapper:
                 "windows_skipped_by_cascade": skipped,
                 "overlap": self.overlap,
                 "smoothing": self.smoothing,
+                "threshold_mode": self.threshold_mode,
+                "threshold_lo_used": self._effective_thresholds(smoothed)[0],
+                "threshold_hi_used": self._effective_thresholds(smoothed)[1],
             },
         )
+
+    def _effective_thresholds(self, heat: np.ndarray) -> tuple[float, float]:
+        """Where to cut this particular map.
+
+        `threshold_lo`/`threshold_hi` are absolute cuts on a score whose
+        distribution is not stable under redistribution. Heavy JPEG lifts the
+        whole map (compression artifacts read like generation artifacts to a
+        patch-scale detector) and heavy noise flattens it, so the same fixed cut
+        selects most of the frame in one case and none of it in the other,
+        without the image's content having changed. Both are common-mode shifts.
+
+        Two ways to remove one, kept as options rather than a new default
+        because the absolute cuts are what every existing number was measured
+        against:
+
+        * `quantile` -- cut at this map's own upper tail. Fully shift-invariant,
+          but it will manufacture a tail on a map that has none, so it is gated
+          on `adaptive_min_spread`: a map flat enough to have no real structure
+          keeps the absolute cuts and is allowed to find nothing.
+        * `median_shift` -- estimate the common-mode offset as the gap between
+          this map's median and a reference median, subtract it, and keep the
+          absolute cuts. Preserves the meaning of 0.45/0.75 and cannot invent a
+          tail, but only corrects a pure translation.
+        """
+        if self.threshold_mode == "absolute":
+            return self.threshold_lo, self.threshold_hi
+
+        finite = heat[~np.isnan(heat)]
+        if finite.size == 0:
+            return self.threshold_lo, self.threshold_hi
+
+        if self.threshold_mode == "quantile":
+            # Tail excess, not MAD. MAD measures the background's own scatter,
+            # which a small bright region barely moves -- so a MAD gate reads a
+            # map with one real edit in it as "featureless" and disables itself
+            # exactly where it was needed. The question here is not how noisy
+            # the field is but whether there is an upper tail worth cutting at.
+            median = float(np.median(finite))
+            spread = float(np.quantile(finite, 0.98)) - median
+            if spread < self.adaptive_min_spread:
+                return self.threshold_lo, self.threshold_hi
+            hi = float(np.quantile(finite, self.adaptive_q_hi))
+            lo = float(np.quantile(finite, self.adaptive_q_lo))
+            # Keep the invariant the constructor enforces, and never let the
+            # adaptive cut land below the floor where a score is not evidence.
+            hi = min(1.0, max(hi, self.threshold_lo))
+            lo = min(lo, hi)
+            return lo, hi
+
+        # median_shift
+        offset = float(np.median(finite)) - self.adaptive_ref_median
+        return self.threshold_lo + offset, self.threshold_hi + offset
 
     def _label(self, heat: np.ndarray, support: np.ndarray) -> np.ndarray:
         labels = np.full(heat.shape, LABEL_UNCERTAIN, dtype=np.uint8)
         known = ~np.isnan(heat)
-        labels[known & (heat >= self.threshold_hi)] = LABEL_AI
-        labels[known & (heat <= self.threshold_lo)] = LABEL_NON_AI
+        lo, hi = self._effective_thresholds(heat)
+        labels[known & (heat >= hi)] = LABEL_AI
+        labels[known & (heat <= lo)] = LABEL_NON_AI
 
         # Thinly-covered pixels get demoted to uncertain rather than trusted:
         # the frame edge is where support is structurally lowest and where a

@@ -101,12 +101,55 @@ CONDITIONS: list[tuple[str, object, object]] = [
 ]
 
 
+def _class_stats(rows: list[dict]) -> dict | None:
+    """Per-class view of how much of the frame the map lit up.
+
+    `frac_regions_fired` on the real rows is the false-positive rate of the
+    localisation stage: every real image that grows a region is an image the
+    local hypothesis can push above the decision threshold on its own.
+    """
+    if not rows:
+        return None
+    return {
+        "n": len(rows),
+        "mean_score": float(np.mean([r["score"] for r in rows])),
+        "mean_whole_image_score": float(np.mean([r["whole_image_score"] for r in rows])),
+        "mean_regions": float(np.mean([r["n_regions"] for r in rows])),
+        "frac_regions_fired": float(np.mean([r["n_regions"] > 0 for r in rows])),
+        "mean_map_score": float(np.mean([r["map"]["mean_score"] for r in rows])),
+        "mean_map_p95": float(np.mean([r["map"]["p95_score"] for r in rows])),
+        "mean_map_median": float(np.mean([r["map"].get("median_score", float("nan")) for r in rows])),
+        "mean_frac_likely_ai": float(np.mean([r["map"]["frac_likely_ai"] for r in rows])),
+        "mean_frac_uncertain": float(np.mean([r["map"]["frac_uncertain"] for r in rows])),
+        "mean_frac_likely_non_ai": float(np.mean([r["map"]["frac_likely_non_ai"] for r in rows])),
+        "mean_confidence_uncapped": float(np.mean([r["confidence_uncapped"] for r in rows])),
+        "verdicts": dict(Counter(r["verdict"] for r in rows)),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data_dir", default="eval_data/sid_set_val")
     parser.add_argument("--out", default="eval_results/robustness.json")
     parser.add_argument("--limit", type=int, default=15, help="Images per class")
     parser.add_argument("--backend", default=None)
+    parser.add_argument("--dual", action="store_true",
+                        help="Wrap the pipeline in DualBackendAnalyzer: fall back to the "
+                             "whole-image pathway when the trust signal says localisation "
+                             "is unreliable for this image")
+    parser.add_argument("--trust_threshold", type=float, default=None,
+                        help="--dual only: trust signal cut. Default is the value frozen "
+                             "in dual_backend.py, tuned on shard 4")
+    parser.add_argument("--fallback_backend", default=None,
+                        help="--dual only: 'self' (default) reuses the primary's own "
+                             "whole-image pass; a Hub id routes to a separate model")
+    parser.add_argument("--threshold_mode", default=None,
+                        choices=["absolute", "quantile", "median_shift"],
+                        help="How the map's AI/non-AI cuts are placed. 'absolute' is the "
+                             "shipped default; the adaptive modes remove the common-mode "
+                             "distribution shift that degradation induces (mapper/heatmap.py)")
+    parser.add_argument("--adaptive_ref_median", type=float, default=None,
+                        help="median_shift only: the clean-corpus map median to correct toward")
     parser.add_argument("--max_side", type=int, default=768,
                         help="Lower than the shipped default to keep this run tractable; "
                              "the comparison across conditions is what matters here, and "
@@ -124,10 +167,27 @@ def main():
 
     config = load_config()
     config["mapper"]["max_side"] = args.max_side
+    if args.threshold_mode:
+        config["mapper"]["threshold_mode"] = args.threshold_mode
+    if args.adaptive_ref_median is not None:
+        config["mapper"]["adaptive_ref_median"] = args.adaptive_ref_median
     if args.backend:
         config["backend"]["name"] = args.backend
         config["backend"]["model_id"] = None
     analyzer = RegionAwareAnalyzer(config)
+    dual = None
+    if args.dual:
+        from dual_backend import DualBackendAnalyzer
+
+        dual_cfg = {"trust": {}, "fallback": {}}
+        if args.trust_threshold is not None:
+            dual_cfg["trust"]["threshold"] = args.trust_threshold
+        if args.fallback_backend is not None:
+            dual_cfg["fallback"]["backend"] = args.fallback_backend
+        # Score both arms on every image so the gated and ungated numbers come
+        # from one pass over the same frames.
+        dual_cfg["fallback"]["eager"] = True
+        dual = DualBackendAnalyzer(dual_cfg, primary=analyzer)
 
     images = {}
     truths = {}
@@ -139,6 +199,7 @@ def main():
                 truths[row["stem"]] = np.asarray(handle.convert("L")) > 127
 
     results = {}
+    per_image: dict[str, list[dict]] = {}
     clean_verdicts: dict[str, str] = {}
 
     bar = _bar(len(CONDITIONS) * len(items))
@@ -148,8 +209,17 @@ def main():
         for row in items:
             stem = row["stem"]
             image = transform(images[stem])
-            report = analyzer.analyse(image)
+            if dual is not None:
+                outcome = dual.analyse(image)
+                report = outcome.report
+            else:
+                outcome, report = None, analyzer.analyse(image)
             pred = predicted_mask(report, image.size)
+            if outcome is not None and not outcome.trusted:
+                # The gate declined to believe the regions, so the report does
+                # not show them -- and localisation must be scored on what the
+                # system actually reported, not on what it privately computed.
+                pred = np.zeros_like(pred)
             if bar is not None:
                 bar.set_postfix({"condition": cond_name}, refresh=False)
                 bar.update(1)
@@ -157,7 +227,7 @@ def main():
             record = {
                 "stem": stem,
                 "class": row["class"],
-                "score": float(report.score),
+                "score": float(outcome.score) if outcome is not None else float(report.score),
                 # fuse() computes this unconditionally as one whole-image backend
                 # call, whether or not any region fires -- so recording it costs
                 # nothing extra and gives the with/without-localisation pairing
@@ -165,8 +235,33 @@ def main():
                 "whole_image_score": float(report.verdict.details["whole_image_score"]),
                 "verdict": report.verdict.verdict,
                 "confidence": float(report.verdict.confidence),
-                "n_regions": len(report.verdict.findings),
+                # The capped value saturates at UNCALIBRATED_CONFIDENCE_CAP on an
+                # uncalibrated map, which is every run that ships. Without the
+                # pre-cap number this experiment cannot test its own stated
+                # hypothesis -- that confidence falls as the evidence degrades.
+                "confidence_uncapped": float(
+                    report.verdict.details.get("confidence_uncapped", report.verdict.confidence)
+                ),
+                "confidence_capped": bool(
+                    report.verdict.details.get("confidence_capped_by_calibration", False)
+                ),
+                "n_regions": 0 if (outcome is not None and not outcome.trusted)
+                             else len(report.verdict.findings),
+                # The map's own score distribution. Region proposal thresholds are
+                # absolute (threshold_lo/hi), so a degradation that shifts this
+                # distribution bodily up or down changes how much of the frame
+                # fires without the image's content changing at all. That is the
+                # difference between a detector that degrades and one that inverts.
+                "map": dict(report.verdict.details["map"]),
             }
+            if outcome is not None:
+                record["dual"] = {
+                    "trusted": bool(outcome.trusted),
+                    "source": outcome.source,
+                    "signal_value": float(outcome.signal_value),
+                    "fallback_score": outcome.fallback_score,
+                    "ungated_score": float(report.score),
+                }
             if stem in truths:
                 truth = truths[stem]
                 if pred.shape != truth.shape:  # crop changes the frame
@@ -180,6 +275,7 @@ def main():
 
         if cond_name == "clean":
             clean_verdicts = {r["stem"]: r["verdict"] for r in rows}
+        per_image[cond_name] = rows
 
         real = np.array([r["score"] for r in rows if r["class"] == "real"])
         tampered = np.array([r["score"] for r in rows if r["class"] == "tampered"])
@@ -207,6 +303,18 @@ def main():
             "mean_localisation_recall": float(np.mean([m["recall"] for m in loc])) if loc else None,
             "mean_localisation_iou": float(np.mean([m["iou"] for m in loc])) if loc else None,
             "mean_regions": float(np.mean([r["n_regions"] for r in rows])),
+            "frac_distrusted": (float(np.mean([r["dual"]["trusted"] is False for r in rows]))
+                                if "dual" in rows[0] else None),
+            "mean_confidence_uncapped": float(np.mean([r["confidence_uncapped"] for r in rows])),
+            "frac_confidence_capped": float(np.mean([r["confidence_capped"] for r in rows])),
+            # Split by class, because the aggregate hides the failure that
+            # matters: regions firing on *real* images is what destroys AUC,
+            # and it looks identical to regions firing on tampered ones until
+            # the two are separated.
+            "by_class": {
+                cls: _class_stats([r for r in rows if r["class"] == cls])
+                for cls in ("real", "tampered", "synthetic")
+            },
         }
         r = results[cond_name]
         print(
@@ -228,7 +336,15 @@ def main():
         "backend": describe() if describe else {"backend": getattr(analyzer.scorer, "name", "?")},
         "images_per_class": args.limit,
         "max_side": args.max_side,
+        "dual": bool(args.dual),
+        "trust_threshold": args.trust_threshold,
+        "fallback_backend": args.fallback_backend,
+        "threshold_mode": args.threshold_mode or "absolute",
+        "adaptive_ref_median": args.adaptive_ref_median,
         "conditions": results,
+        # Kept so a follow-up question about *which* images moved can be answered
+        # from the artefact instead of costing another GPU hour.
+        "per_image": per_image,
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
